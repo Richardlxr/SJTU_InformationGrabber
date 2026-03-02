@@ -213,6 +213,31 @@ Ubuntu / CentOS / Debian 获取全天候挂机首选。
    sudo systemctl enable webbugger
    ```
 
+### 🪟 Windows - 使用任务计划程序
+让程序在 Windows 开机时自动在后台静默运行。
+
+1. 创建一个批处理文件 `run_webbugger.bat` 放在项目目录下（例如 `D:\Web_bugger\run_webbugger.bat`）：
+   ```bat
+   @echo off
+   cd /d D:\Web_bugger
+   :: 替换为你自己的虚拟环境 Python 的绝对路径
+   C:\Users\YourName\miniconda3\envs\web_bugger\python.exe -m web_bugger.cli
+   ```
+2. 创建一个 VBS 脚本 `start_hidden.vbs` 用来隐藏黑色的终端窗口：
+   ```vbs
+   Set WshShell = CreateObject("WScript.Shell")
+   ' 替换为你的 bat 文件绝对路径
+   WshShell.Run chr(34) & "D:\Web_bugger\run_webbugger.bat" & Chr(34), 0
+   Set WshShell = Nothing
+   ```
+3. 按 `Win+R` 输入 `taskschd.msc` 打开**任务计划程序**。
+4. 点击右侧 **创建基本任务...**：
+   - 名称填写：`Web Bugger Monitor`
+   - 触发器选择：**计算机启动时**（或“当当前用户登录时”）
+   - 操作选择：**启动程序**
+   - 程序或脚本：浏览选择刚创建的 `start_hidden.vbs` 文件
+   - 完成后保存即可实现开机后台自动运行。
+
 ### 临时命令挂载（全平台可用）
 如果不希望编写配置文件，可以通过以下简单的命令行工具挂载：
 
