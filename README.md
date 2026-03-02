@@ -1,4 +1,5 @@
-# Web Bugger
+# 还在担心错过教务通知？
+# SJTU 你的信息助手
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -225,6 +226,8 @@ screen -S bugger
 web-bugger
 # 断开当前会话：按 Ctrl+A 然后按 D
 ```
+
+## 欢迎增量更新和内容扩充♥️
 
 ## 许可证
 
