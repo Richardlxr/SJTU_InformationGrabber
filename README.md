@@ -254,6 +254,11 @@ web-bugger
 
 ## 欢迎增量更新和内容扩充♥️
 
+
+# 3.8 更新
+
+新增了计算机学院网站https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html中四个通知模块的抓取。
+
 ## 许可证
 
 [MIT](LICENSE)

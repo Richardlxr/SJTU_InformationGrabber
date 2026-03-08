@@ -1,5 +1,10 @@
 """
-爬虫模块 - 从上海交通大学教务处网站抓取公告（支持多个页面、多种布局）
+爬虫模块 - 从上海交通大学教务处/计算机学院网站抓取公告（支持多个页面、多种布局）
+
+支持布局:
+  A — jwc.sjtu.edu.cn 教务处板块式
+  B — jwc.sjtu.edu.cn 面向学生通知列表式
+  C — cs.sjtu.edu.cn  计算机学院学生工作 AJAX 分页列表式
 """
 
 from __future__ import annotations
@@ -18,7 +23,16 @@ logger = logging.getLogger(__name__)
 
 
 class Scraper:
-    """教务处网站公告爬虫"""
+    """教务处/计算机学院网站公告爬虫"""
+
+    # 布局 C: cs.sjtu.edu.cn 学生工作 AJAX 接口
+    _CS_SJTU_AJAX_URL = "https://cs.sjtu.edu.cn/active/ajax_type_list.html"
+    _CS_SJTU_CAT_SECTION: dict[str, str] = {
+        "xsgz-tzgg-djdy": "党建德育",
+        "xsgz-tzgg-txgz": "团学工作",
+        "xsgz-tzgg-xssw": "学生事务",
+        "xsgz-tzgg-zyfz": "职业发展",
+    }
 
     def __init__(self, config: ScraperConfig) -> None:
         self._config = config
@@ -79,6 +93,10 @@ class Scraper:
         """根据页面结构自动选择解析策略"""
         soup = BeautifulSoup(html, "html.parser")
 
+        # 布局 C: cs.sjtu.edu.cn 计算机学院 AJAX 动态加载列表
+        if soup.select_one("div#article_list") is not None:
+            return self._parse_cs_sjtu(html, soup, page_url)
+
         # 布局 A: xwtg.htm 板块式（多个 div.w50l / div.w50r，每个含 Newslist1）
         sections = soup.select("div.w50l, div.w50r")
         if sections:
@@ -91,6 +109,125 @@ class Scraper:
 
         logger.warning("未识别的页面布局: %s", page_url)
         return []
+
+    # ------------------------------------------------------------------
+    # 布局 C — cs.sjtu.edu.cn 计算机学院 AJAX 列表式
+    # ------------------------------------------------------------------
+
+    def _parse_cs_sjtu(
+        self, html: str, soup: BeautifulSoup, page_url: str
+    ) -> list[Announcement]:
+        """
+        页面使用 AJAX POST 接口动态加载通知列表：
+          POST https://cs.sjtu.edu.cn/active/ajax_type_list.html
+          Params: page, cat_code, type, search, extend_id, template
+        支持自动翻页直至取得全部公告。
+        """
+        m = re.search(r"cat_code\s*:\s*['\"]([^'\"]+)['\"]", html)
+        if m is None:
+            logger.warning("cs.sjtu 页面未找到 cat_code，跳过: %s", page_url)
+            return []
+        cat_code = m.group(1)
+
+        section_name = self._CS_SJTU_CAT_SECTION.get(cat_code)
+        if section_name is None:
+            active_a = soup.select_one("div.swiper-slide a.on")
+            section_name = active_a.get_text(strip=True) if active_a else cat_code
+
+        logger.info("cs.sjtu 板块 [%s] cat_code=%s", section_name, cat_code)
+        return self._fetch_all_cs_sjtu_pages(cat_code, section_name, page_url)
+
+    def _fetch_all_cs_sjtu_pages(
+        self, cat_code: str, section: str, referer: str
+    ) -> list[Announcement]:
+        """分页 POST AJAX 接口，取出所有条目"""
+        results: list[Announcement] = []
+        seen_urls: set[str] = set()
+        page = 1
+
+        while True:
+            try:
+                resp = self._session.post(
+                    self._CS_SJTU_AJAX_URL,
+                    data={
+                        "page": page,
+                        "cat_code": cat_code,
+                        "type": "",
+                        "search": "",
+                        "extend_id": "0",
+                        "template": "ajax_news_list1_search",
+                    },
+                    timeout=self._config.request_timeout,
+                    headers={
+                        "Referer": referer,
+                        "X-Requested-With": "XMLHttpRequest",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.error(
+                    "cs.sjtu AJAX 请求失败 (cat=%s, page=%d): %s", cat_code, page, e
+                )
+                break
+
+            content_html = data.get("content", "")
+            if not content_html:
+                break
+
+            items_soup = BeautifulSoup(content_html, "html.parser")
+            items: list[Tag] = items_soup.find_all("li")
+            if not items:
+                break
+
+            for item in items:
+                ann = self._parse_cs_sjtu_item(item, section)
+                if ann is not None and ann.url not in seen_urls:
+                    seen_urls.add(ann.url)
+                    results.append(ann)
+
+            total = int(data.get("count", 0))
+            if len(results) >= total:
+                break
+            page += 1
+
+        logger.debug("cs.sjtu [%s] 共抓取 %d 条（%d 页）", section, len(results), page)
+        return results
+
+    @staticmethod
+    def _parse_cs_sjtu_item(item: Tag, section: str) -> Announcement | None:
+        """
+        HTML 结构:
+          <li>
+            <a href="https://cs.sjtu.edu.cn/...">
+              <div class="time"><p>05</p><span>2025-11</span></div>
+              <div class="tit line-2">标题</div>
+            </a>
+          </li>
+        """
+        link = item.select_one("a")
+        if link is None:
+            return None
+        href = str(link.get("href", ""))
+        if not href or href.startswith("javascript:"):
+            return None
+
+        tit_div = link.select_one("div.tit")
+        title = tit_div.get_text(strip=True) if tit_div else link.get_text(strip=True)
+        if not title:
+            return None
+
+        # 日期: <div class="time"><p>05</p><span>2025-11</span></div> → 2025-11-05
+        date = ""
+        time_div = link.select_one("div.time")
+        if time_div:
+            day_tag = time_div.select_one("p")
+            ym_tag = time_div.select_one("span")
+            day = day_tag.get_text(strip=True).zfill(2) if day_tag else "01"
+            ym = ym_tag.get_text(strip=True) if ym_tag else ""
+            date = f"{ym}-{day}" if ym else ""
+
+        return Announcement(title=title, url=href, date=date, section=section)
 
     # ------------------------------------------------------------------
     # 布局 A — xwtg.htm 板块式

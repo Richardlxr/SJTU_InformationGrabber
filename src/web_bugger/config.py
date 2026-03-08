@@ -36,6 +36,11 @@ class ScraperConfig:
         default_factory=lambda: [
             "https://jwc.sjtu.edu.cn/xwtg.htm",
             "https://jwc.sjtu.edu.cn/index/mxxsdtz.htm",
+            # 计算机学院学生工作通知公告（党建德育 / 团学工作 / 学生事务 / 职业发展）
+            "https://cs.sjtu.edu.cn/xsgz-tzgg-djdy.html",
+            "https://cs.sjtu.edu.cn/xsgz-tzgg-txgz.html",
+            "https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html",
+            "https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html",
         ]
     )
     base_url: str = "https://jwc.sjtu.edu.cn/"
@@ -97,7 +102,14 @@ class AppConfig:
         # 支持逗号分隔的多个 URL
         urls_str = os.getenv(
             "TARGET_URLS",
-            "https://jwc.sjtu.edu.cn/xwtg.htm,https://jwc.sjtu.edu.cn/index/mxxsdtz.htm",
+            (
+                "https://jwc.sjtu.edu.cn/xwtg.htm,"
+                "https://jwc.sjtu.edu.cn/index/mxxsdtz.htm,"
+                "https://cs.sjtu.edu.cn/xsgz-tzgg-djdy.html,"
+                "https://cs.sjtu.edu.cn/xsgz-tzgg-txgz.html,"
+                "https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html,"
+                "https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html"
+            ),
         )
         target_urls = [u.strip() for u in urls_str.split(",") if u.strip()]
 
