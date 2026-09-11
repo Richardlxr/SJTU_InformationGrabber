@@ -11,15 +11,43 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from types import TracebackType
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from web_bugger.config import ScraperConfig
 from web_bugger.models import Announcement
 
 logger = logging.getLogger(__name__)
+
+# requests 在响应头缺少 charset 时会默认用 ISO-8859-1 解码，
+# 下列取值都需要改用内容嗅探，否则中文会乱码。
+_UNTRUSTED_ENCODINGS = {"", "iso-8859-1", "latin-1", "ascii", "us-ascii"}
+
+_INVALID_HREF_PREFIXES = ("#", "javascript:", "mailto:", "tel:")
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    """一次抓取的整体结果（用于区分「没有公告」和「抓取失败」）"""
+
+    items: list[Announcement] = field(default_factory=list)
+    pages_total: int = 0
+    failed_urls: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed_urls
+
+    @property
+    def all_failed(self) -> bool:
+        return self.pages_total > 0 and len(self.failed_urls) == self.pages_total
 
 
 class Scraper:
@@ -36,8 +64,48 @@ class Scraper:
 
     def __init__(self, config: ScraperConfig) -> None:
         self._config = config
-        self._session = requests.Session()
-        self._session.headers.update(config.headers)
+        self._session = self._build_session(config)
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_session(config: ScraperConfig) -> requests.Session:
+        session = requests.Session()
+        session.headers.update(config.headers)
+        retry = Retry(
+            total=config.max_retries,
+            connect=config.max_retries,
+            read=config.max_retries,
+            status=config.max_retries,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry, pool_connections=config.max_workers, pool_maxsize=config.max_workers
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def close(self) -> None:
+        """释放连接池"""
+        self._session.close()
+
+    def __enter__(self) -> Scraper:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
 
     # ------------------------------------------------------------------
     # public API
@@ -48,27 +116,68 @@ class Scraper:
         依次抓取所有配置的目标页面，合并去重后返回。
 
         Returns:
-            公告列表（未排序）
+            公告列表（未排序）；抓取失败的页面会被跳过
         """
+        return self.fetch_with_status().items
+
+    def fetch_with_status(self) -> FetchResult:
+        """
+        抓取所有目标页面，并返回失败页面信息。
+
+        多个页面并发抓取；输出顺序按 `target_urls` 顺序稳定排列。
+        """
+        urls = list(self._config.target_urls)
+        if not urls:
+            logger.warning("未配置任何目标页面（TARGET_URLS 为空）")
+            return FetchResult()
+
+        per_url: dict[str, list[Announcement]] = {}
+        failed: list[str] = []
+        workers = max(1, min(self._config.max_workers, len(urls)))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self._fetch_one, url): url for url in urls}
+            for future in as_completed(futures):
+                url = futures[future]
+                try:
+                    items = future.result()
+                except Exception:
+                    logger.exception("抓取页面时出现未预期错误: %s", url)
+                    failed.append(url)
+                    continue
+                if items is None:
+                    failed.append(url)
+                else:
+                    per_url[url] = items
+
         all_items: list[Announcement] = []
         seen_urls: set[str] = set()
-
-        for url in self._config.target_urls:
-            html = self._download(url)
-            if html is None:
-                continue
-            items = self._parse(html, url)
-            for item in items:
+        for url in urls:
+            for item in per_url.get(url, []):
                 if item.url not in seen_urls:
                     seen_urls.add(item.url)
                     all_items.append(item)
 
+        if failed:
+            logger.warning(
+                "%d/%d 个页面抓取失败: %s", len(failed), len(urls), ", ".join(failed)
+            )
         logger.info(
-            "共抓取到 %d 条公告（来自 %d 个页面）",
+            "共抓取到 %d 条公告（来自 %d 个页面，成功 %d 个）",
             len(all_items),
-            len(self._config.target_urls),
+            len(urls),
+            len(urls) - len(failed),
         )
-        return all_items
+        return FetchResult(
+            items=all_items, pages_total=len(urls), failed_urls=tuple(failed)
+        )
+
+    def _fetch_one(self, url: str) -> list[Announcement] | None:
+        """下载并解析单个页面；失败返回 None"""
+        html = self._download(url)
+        if html is None:
+            return None
+        return self._parse(html, url)
 
     # ------------------------------------------------------------------
     # download
@@ -78,12 +187,34 @@ class Scraper:
         """下载目标页面 HTML"""
         try:
             resp = self._session.get(url, timeout=self._config.request_timeout)
-            resp.encoding = "utf-8"
             resp.raise_for_status()
-            return resp.text
+            return self._decode(resp)
         except requests.RequestException as e:
             logger.error("请求页面失败 (%s): %s", url, e)
             return None
+
+    @staticmethod
+    def _decode(resp: requests.Response) -> str:
+        """
+        按响应解码正文。
+
+        SJTU 站点在 HTTP 头里通常不带 charset（requests 会退回 ISO-8859-1），
+        因此对这类不可信默认值改用内容嗅探，避免中文标题变成乱码。
+        """
+        declared = (resp.encoding or "").strip().lower()
+        if declared in _UNTRUSTED_ENCODINGS:
+            detected = resp.apparent_encoding
+            if detected:
+                logger.debug(
+                    "%s 响应头未声明 charset（encoding=%r），改用嗅探结果 %s",
+                    resp.url,
+                    resp.encoding,
+                    detected,
+                )
+                text: str = resp.content.decode(detected, errors="replace")
+                return text
+        body: str = resp.text
+        return body
 
     # ------------------------------------------------------------------
     # parse — 自动检测页面布局并分派
@@ -100,7 +231,7 @@ class Scraper:
         # 布局 A: xwtg.htm 板块式（多个 div.w50l / div.w50r，每个含 Newslist1）
         sections = soup.select("div.w50l, div.w50r")
         if sections:
-            return self._parse_xwtg(soup, sections)
+            return self._parse_xwtg(soup, sections, page_url)
 
         # 布局 B: mxxsdtz.htm 列表式（单个 div.Newslist > ul > li.clearfix）
         newslist = soup.select_one("div.Newslist")
@@ -140,12 +271,18 @@ class Scraper:
     def _fetch_all_cs_sjtu_pages(
         self, cat_code: str, section: str, referer: str
     ) -> list[Announcement]:
-        """分页 POST AJAX 接口，取出所有条目"""
+        """
+        分页 POST AJAX 接口，取出所有条目。
+
+        必须设置页数上限：若服务端忽略 page 参数（或返回错误的 count），
+        `len(results) >= total` 永远不成立，会无限翻页把守护进程卡死。
+        """
         results: list[Announcement] = []
         seen_urls: set[str] = set()
+        max_pages = max(1, self._config.max_pages)
         page = 1
 
-        while True:
+        while page <= max_pages:
             try:
                 resp = self._session.post(
                     self._CS_SJTU_AJAX_URL,
@@ -165,37 +302,51 @@ class Scraper:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-            except Exception as e:
+            except (requests.RequestException, ValueError) as e:
                 logger.error(
                     "cs.sjtu AJAX 请求失败 (cat=%s, page=%d): %s", cat_code, page, e
                 )
                 break
 
-            content_html = data.get("content", "")
-            if not content_html:
+            if not isinstance(data, dict):
+                logger.error("cs.sjtu AJAX 返回结构异常 (cat=%s): %r", cat_code, data)
                 break
 
-            items_soup = BeautifulSoup(content_html, "html.parser")
-            items: list[Tag] = items_soup.find_all("li")
+            content_html = data.get("content", "")
+            if not isinstance(content_html, str) or not content_html:
+                break
+
+            items = BeautifulSoup(content_html, "html.parser").find_all("li")
             if not items:
                 break
 
             for item in items:
-                ann = self._parse_cs_sjtu_item(item, section)
+                ann = self._parse_cs_sjtu_item(item, section, referer)
                 if ann is not None and ann.url not in seen_urls:
                     seen_urls.add(ann.url)
                     results.append(ann)
 
-            total = int(data.get("count", 0))
+            try:
+                total = int(data.get("count", 0))
+            except (TypeError, ValueError):
+                total = 0
             if len(results) >= total:
                 break
             page += 1
+        else:
+            logger.warning(
+                "cs.sjtu [%s] 达到最大翻页数 %d，可能仍有遗漏（count 与实际不一致？）",
+                section,
+                max_pages,
+            )
 
         logger.debug("cs.sjtu [%s] 共抓取 %d 条（%d 页）", section, len(results), page)
         return results
 
-    @staticmethod
-    def _parse_cs_sjtu_item(item: Tag, section: str) -> Announcement | None:
+    @classmethod
+    def _parse_cs_sjtu_item(
+        cls, item: Tag, section: str, base_url: str
+    ) -> Announcement | None:
         """
         HTML 结构:
           <li>
@@ -208,8 +359,8 @@ class Scraper:
         link = item.select_one("a")
         if link is None:
             return None
-        href = str(link.get("href", ""))
-        if not href or href.startswith("javascript:"):
+        url = cls._normalize_href(str(link.get("href", "")), base_url)
+        if url is None:
             return None
 
         tit_div = link.select_one("div.tit")
@@ -227,21 +378,21 @@ class Scraper:
             ym = ym_tag.get_text(strip=True) if ym_tag else ""
             date = f"{ym}-{day}" if ym else ""
 
-        return Announcement(title=title, url=href, date=date, section=section)
+        return Announcement(title=title, url=url, date=date, section=section)
 
     # ------------------------------------------------------------------
     # 布局 A — xwtg.htm 板块式
     # ------------------------------------------------------------------
 
     def _parse_xwtg(
-        self, soup: BeautifulSoup, sections: list[Tag]
+        self, soup: BeautifulSoup, sections: list[Tag], page_url: str
     ) -> list[Announcement]:
         results: list[Announcement] = []
         for section_div in sections:
             section_name = self._extract_section_name(section_div)
             items: list[Tag] = section_div.select("div.Newslist1 ul li")
             for item in items:
-                a = self._parse_xwtg_item(item, section_name)
+                a = self._parse_xwtg_item(item, section_name, page_url)
                 if a is not None:
                     results.append(a)
         return results
@@ -251,18 +402,25 @@ class Scraper:
         tag = section_div.select_one("div.nytit2 h2")
         return tag.get_text(strip=True) if tag else "未知板块"
 
-    def _parse_xwtg_item(self, item: Tag, section: str) -> Announcement | None:
+    @classmethod
+    def _parse_xwtg_item(
+        cls, item: Tag, section: str, base_url: str
+    ) -> Announcement | None:
         link_tag = item.select_one("a")
         if link_tag is None:
             return None
 
+        url = cls._normalize_href(str(link_tag.get("href", "")), base_url)
+        if url is None:
+            return None
+
         title = link_tag.get_text(strip=True)
-        href = link_tag.get("href", "")
+        if not title:
+            return None
 
         date_span = item.select_one("span")
         date = date_span.get_text(strip=True) if date_span else ""
 
-        url = self._resolve_url(str(href))
         return Announcement(title=title, url=url, date=date, section=section)
 
     # ------------------------------------------------------------------
@@ -288,12 +446,15 @@ class Scraper:
         results: list[Announcement] = []
         items: list[Tag] = newslist.select("ul > li.clearfix")
         for item in items:
-            a = self._parse_mxxsdtz_item(item, section_name)
+            a = self._parse_mxxsdtz_item(item, section_name, page_url)
             if a is not None:
                 results.append(a)
         return results
 
-    def _parse_mxxsdtz_item(self, item: Tag, section: str) -> Announcement | None:
+    @classmethod
+    def _parse_mxxsdtz_item(
+        cls, item: Tag, section: str, base_url: str
+    ) -> Announcement | None:
         wz = item.select_one("div.wz")
         if wz is None:
             return None
@@ -301,13 +462,15 @@ class Scraper:
         if link_tag is None:
             return None
 
+        url = cls._normalize_href(str(link_tag.get("href", "")), base_url)
+        if url is None:
+            return None
+
         title = link_tag.get_text(strip=True)
-        href = link_tag.get("href", "")
+        if not title:
+            return None
 
-        # 日期组合: <div class="sj"><h2>02</h2><p>2026.03</p></div> → 2026-03-02
-        date = self._extract_mxxsdtz_date(item)
-
-        url = self._resolve_url(str(href))
+        date = cls._extract_mxxsdtz_date(item)
         return Announcement(title=title, url=url, date=date, section=section)
 
     @staticmethod
@@ -322,17 +485,31 @@ class Scraper:
         day = day_tag.get_text(strip=True).zfill(2)
         ym = ym_tag.get_text(strip=True)  # e.g. "2026.03"
         # 转换为 "2026-03-02"
-        match = re.match(r"(\d{4})\.(\d{2})", ym)
+        match = re.match(r"(\d{4})\.(\d{1,2})", ym)
         if match:
-            return f"{match.group(1)}-{match.group(2)}-{day}"
+            month = match.group(2).zfill(2)
+            return f"{match.group(1)}-{month}-{day}"
         return f"{ym}-{day}"
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
 
-    def _resolve_url(self, href: str) -> str:
-        """将相对链接解析为绝对链接"""
-        if href and not href.startswith("http"):
-            return urljoin(self._config.base_url, href)
-        return href
+    @staticmethod
+    def _normalize_href(href: str, base_url: str) -> str | None:
+        """
+        校验并补全链接。
+
+        Returns:
+            绝对 URL；空链接、锚点、javascript:/mailto:/tel: 等无效链接返回 None
+        """
+        href = (href or "").strip()
+        if not href or href.startswith(_INVALID_HREF_PREFIXES):
+            return None
+        if href.startswith("http"):
+            return href
+        return urljoin(base_url, href)
+
+    def _resolve_url(self, href: str, base_url: str | None = None) -> str:
+        """将相对链接解析为绝对链接（无效链接返回空串）"""
+        return self._normalize_href(href, base_url or self._config.base_url) or ""

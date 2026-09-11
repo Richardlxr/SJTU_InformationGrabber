@@ -24,18 +24,20 @@
 ## 项目结构
 
 ```
-Web_bugger/
+SJTU_InformationGrabber/
 ├── src/web_bugger/          # 源代码包
 │   ├── __init__.py          # 包元信息
 │   ├── cli.py               # 命令行入口
-│   ├── config.py            # 配置管理 (dataclass)
+│   ├── config.py            # 配置管理 (dataclass + 校验)
 │   ├── models.py            # 数据模型 (Announcement)
 │   ├── monitor.py           # 监控编排器 (Monitor)
 │   ├── notifier.py          # 邮件通知 (Notifier)
-│   ├── scraper.py           # 网页爬虫 (Scraper)
-│   └── storage.py           # 已读存储 (Storage)
-├── tests/                   # 单元测试
+│   ├── scraper.py           # 网页爬虫 (Scraper，三种布局)
+│   └── storage.py           # 已读存储 (Storage，原子写入)
+├── tests/                   # 单元测试（含抓取/存储/CLI 回归测试）
+├── .github/workflows/ci.yml # CI（ruff + mypy + pytest）
 ├── pyproject.toml           # PEP 621 包配置
+├── pyrightconfig.json       # 编辑器/类型检查解释器配置
 ├── requirements.txt         # pip 依赖清单
 ├── .env.example             # 环境变量模板
 ├── LICENSE                  # MIT 许可证
@@ -69,9 +71,20 @@ cp .env.example .env
 | `RECEIVER_EMAIL` | ✅ | 收件人邮箱地址 |
 | `SMTP_SERVER` | | SMTP 服务器（默认 `smtp.qq.com`） |
 | `SMTP_PORT` | | 端口（默认 `465`） |
-| `SMTP_USE_SSL` | | 是否使用 SSL（默认 `true`） |
-| `TARGET_URLS` | | 监控页面 URL，逗号分隔 |
-| `CHECK_INTERVAL` | | 检查间隔秒数（默认 `300`） |
+| `SMTP_USE_SSL` | | 是否使用 SSL（默认 `true`；`false` 时走 STARTTLS） |
+| `SMTP_TIMEOUT` | | SMTP 超时秒数（默认 `20`） |
+| `TARGET_URLS` | | 监控页面 URL，逗号分隔（默认 6 个交大页面） |
+| `CHECK_INTERVAL` | | 检查间隔秒数（默认 `300`，最小 `10`） |
+| `BASE_URL` | | 相对链接的兜底解析基准（默认 `https://jwc.sjtu.edu.cn/`） |
+| `DATA_DIR` | | 已读状态文件所在目录（默认项目根目录） |
+| `REQUEST_TIMEOUT` | | 单次 HTTP 超时秒数（默认 `15`） |
+| `MAX_RETRIES` | | 单页面失败重试次数（默认 `3`） |
+| `MAX_WORKERS` | | 并发抓取页面数（默认 `4`） |
+| `MAX_PAGES` | | 单个 AJAX 板块最大翻页数（默认 `50`，防止死循环） |
+| `FAILURE_ALERT_THRESHOLD` | | 连续抓取失败多少次后发告警邮件（默认 `3`） |
+
+> 所有数值型配置都会做范围校验：写错（例如 `SMTP_PORT=abc`）会得到一条带变量名的
+> 明确报错，而不是 Python 堆栈。
 
 <details>
 <summary>常见邮箱 SMTP 配置</summary>

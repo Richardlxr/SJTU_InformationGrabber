@@ -5,10 +5,73 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+
+class ConfigError(ValueError):
+    """配置项非法（例如端口不是数字、间隔为负数）"""
+
+
+def _env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return default if value is None or not value.strip() else value.strip()
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    """读取整型环境变量，非法时抛出带变量名的 ConfigError。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as e:
+        raise ConfigError(
+            f"环境变量 {name} 必须是整数，当前值为 {raw!r}"
+        ) from e
+    if not minimum <= value <= maximum:
+        raise ConfigError(
+            f"环境变量 {name} 必须在 [{minimum}, {maximum}] 之间，当前值为 {value}"
+        )
+    return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _split_addresses(value: str) -> list[str]:
+    """把 "a@x.com, b@y.com; c@z.com" 拆成地址列表"""
+    return [part.strip() for part in re.split(r"[,;]+", value) if part.strip()]
+
+
+def _default_data_dir() -> Path:
+    """
+    状态文件存放目录。
+
+    - 显式配置了 DATA_DIR 时优先使用；
+    - 否则若本模块位于源码检出目录（同级存在 pyproject.toml）则放在项目根目录，
+      保持与旧版本一致的行为、方便查看；
+    - 否则（例如 pip 安装进 site-packages）退回 XDG 数据目录，
+      避免写入只读/升级即丢失的位置。
+    """
+    override = os.getenv("DATA_DIR", "")
+    if override.strip():
+        return Path(override.strip()).expanduser()
+
+    checkout_root = Path(__file__).resolve().parent.parent.parent
+    if (checkout_root / "pyproject.toml").is_file():
+        return checkout_root
+
+    xdg = os.getenv("XDG_DATA_HOME", "").strip()
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return base / "web-bugger"
 
 
 @dataclass
@@ -21,11 +84,17 @@ class SmtpConfig:
     sender_email: str = ""
     sender_password: str = ""
     receiver_email: str = ""
+    timeout: int = 20
+
+    @property
+    def recipients(self) -> list[str]:
+        """收件人列表（支持逗号/分号分隔的多个地址）"""
+        return _split_addresses(self.receiver_email)
 
     @property
     def is_configured(self) -> bool:
         """发件人邮箱、授权码、收件人是否均已配置"""
-        return bool(self.sender_email and self.sender_password and self.receiver_email)
+        return bool(self.sender_email and self.sender_password and self.recipients)
 
 
 @dataclass
@@ -45,6 +114,9 @@ class ScraperConfig:
     )
     base_url: str = "https://jwc.sjtu.edu.cn/"
     request_timeout: int = 15
+    max_retries: int = 3
+    max_workers: int = 4
+    max_pages: int = 50
     headers: dict[str, str] = field(
         default_factory=lambda: {
             "User-Agent": (
@@ -65,9 +137,8 @@ class AppConfig:
     smtp: SmtpConfig = field(default_factory=SmtpConfig)
     scraper: ScraperConfig = field(default_factory=ScraperConfig)
     check_interval: int = 300
-    data_dir: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent.parent.parent
-    )
+    failure_alert_threshold: int = 3
+    data_dir: Path = field(default_factory=_default_data_dir)
 
     @property
     def seen_file(self) -> Path:
@@ -80,55 +151,51 @@ class AppConfig:
         从环境变量（及可选的 .env 文件）加载配置。
 
         Args:
-            env_file: .env 文件路径，为 None 时自动搜索项目根目录
+            env_file: .env 文件路径，为 None 时自动搜索当前目录及其父目录
 
         Returns:
             填充好的 AppConfig 实例
+
+        Raises:
+            ConfigError: 配置项非法（类型错误 / 超出范围）
         """
         if env_file:
-            load_dotenv(env_file)
+            path = Path(env_file).expanduser()
+            if not path.is_file():
+                raise ConfigError(f"指定的 .env 文件不存在: {path}")
+            load_dotenv(path)
         else:
             load_dotenv()
 
         smtp = SmtpConfig(
-            server=os.getenv("SMTP_SERVER", "smtp.qq.com"),
-            port=int(os.getenv("SMTP_PORT", "465")),
-            use_ssl=os.getenv("SMTP_USE_SSL", "true").lower() == "true",
-            sender_email=os.getenv("SENDER_EMAIL", ""),
-            sender_password=os.getenv("SENDER_PASSWORD", ""),
-            receiver_email=os.getenv("RECEIVER_EMAIL", ""),
+            server=_env_str("SMTP_SERVER", "smtp.qq.com"),
+            port=_env_int("SMTP_PORT", 465, minimum=1, maximum=65535),
+            use_ssl=_env_bool("SMTP_USE_SSL", True),
+            sender_email=_env_str("SENDER_EMAIL", ""),
+            sender_password=_env_str("SENDER_PASSWORD", ""),
+            receiver_email=_env_str("RECEIVER_EMAIL", ""),
+            timeout=_env_int("SMTP_TIMEOUT", 20, minimum=1, maximum=300),
         )
 
-        # 支持逗号分隔的多个 URL
-        urls_str = os.getenv(
-            "TARGET_URLS",
-            (
-                "https://jwc.sjtu.edu.cn/xwtg.htm,"
-                "https://jwc.sjtu.edu.cn/index/mxxsdtz.htm,"
-                "https://cs.sjtu.edu.cn/xsgz-tzgg-djdy.html,"
-                "https://cs.sjtu.edu.cn/xsgz-tzgg-txgz.html,"
-                "https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html,"
-                "https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html"
-            ),
-        )
+        default_urls = ",".join(ScraperConfig().target_urls)
+        urls_str = _env_str("TARGET_URLS", default_urls)
         target_urls = [u.strip() for u in urls_str.split(",") if u.strip()]
 
         scraper = ScraperConfig(
-            target_urls=target_urls,
-            base_url=os.getenv("BASE_URL", "https://jwc.sjtu.edu.cn/"),
+            target_urls=target_urls or list(ScraperConfig().target_urls),
+            base_url=_env_str("BASE_URL", "https://jwc.sjtu.edu.cn/"),
+            request_timeout=_env_int("REQUEST_TIMEOUT", 15, minimum=1, maximum=300),
+            max_retries=_env_int("MAX_RETRIES", 3, minimum=0, maximum=10),
+            max_workers=_env_int("MAX_WORKERS", 4, minimum=1, maximum=16),
+            max_pages=_env_int("MAX_PAGES", 50, minimum=1, maximum=1000),
         )
-
-        check_interval = int(os.getenv("CHECK_INTERVAL", "300"))
-
-        data_dir_str = os.getenv("DATA_DIR", "")
-        if data_dir_str:
-            data_dir = Path(data_dir_str)
-        else:
-            data_dir = Path(__file__).resolve().parent.parent.parent
 
         return cls(
             smtp=smtp,
             scraper=scraper,
-            check_interval=check_interval,
-            data_dir=data_dir,
+            check_interval=_env_int("CHECK_INTERVAL", 300, minimum=10, maximum=86400),
+            failure_alert_threshold=_env_int(
+                "FAILURE_ALERT_THRESHOLD", 3, minimum=1, maximum=100
+            ),
+            data_dir=_default_data_dir(),
         )

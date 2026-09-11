@@ -2,6 +2,8 @@
 单元测试 - models
 """
 
+import pytest
+
 from web_bugger.models import Announcement
 
 
@@ -35,8 +37,5 @@ class TestAnnouncement:
 
     def test_frozen(self) -> None:
         a = Announcement(title="T", url="https://x.com/1", date="", section="")
-        try:
+        with pytest.raises(AttributeError):
             a.title = "new"  # type: ignore[misc]
-            assert False, "Should raise FrozenInstanceError"
-        except AttributeError:
-            pass

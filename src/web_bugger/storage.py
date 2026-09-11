@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 from web_bugger.models import Announcement
@@ -14,7 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 class Storage:
-    """基于 JSON 文件的已读公告存储"""
+    """基于 JSON 文件的已读公告存储
+
+    文件内容是一个 URL 字符串数组。写入采用「临时文件 + os.replace」原子替换，
+    避免进程被强杀/断电时把文件截断成空，导致下次运行把所有公告当成新公告重发。
+    """
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -23,6 +30,10 @@ class Storage:
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     @property
     def seen_urls(self) -> frozenset[str]:
@@ -50,18 +61,63 @@ class Storage:
         if not self._path.exists():
             return set()
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-            return set(data)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("读取已存储公告文件失败，将重新创建: %s", e)
+            raw = self._path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning("读取已存储公告文件失败（%s），本次视为空: %s", self._path, e)
             return set()
 
+        if not raw.strip():
+            # 空文件 = 尚无记录（正常首次运行），不要当成损坏文件
+            return set()
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.error("已存储公告文件不是合法 JSON（%s）: %s", self._path, e)
+            self._quarantine()
+            return set()
+
+        if not isinstance(data, list):
+            logger.error(
+                "已存储公告文件格式异常（期望 JSON 数组，实际为 %s），已忽略（%s）",
+                type(data).__name__,
+                self._path,
+            )
+            self._quarantine()
+            return set()
+
+        urls = {item for item in data if isinstance(item, str) and item}
+        skipped = len(data) - len(urls)
+        if skipped:
+            logger.warning("已存储公告文件中 %d 条非字符串记录已被忽略", skipped)
+        return urls
+
+    def _quarantine(self) -> None:
+        """把损坏的状态文件改名备份，避免静默丢弃后又被下一次写入覆盖"""
+        backup = self._path.with_suffix(self._path.suffix + ".corrupt")
+        try:
+            os.replace(self._path, backup)
+            logger.error("损坏的状态文件已备份为 %s", backup)
+        except OSError as e:
+            logger.warning("备份损坏的状态文件失败: %s", e)
+
     def _save(self) -> None:
+        payload = json.dumps(sorted(self._seen), ensure_ascii=False, indent=2)
+        tmp_path: str | None = None
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(
-                json.dumps(sorted(self._seen), ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(self._path.parent), prefix=f".{self._path.name}.", suffix=".tmp"
             )
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, self._path)
+            tmp_path = None
         except OSError as e:
             logger.error("保存已存储公告文件失败: %s", e)
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)

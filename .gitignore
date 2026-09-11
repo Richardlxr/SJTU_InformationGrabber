@@ -32,3 +32,5 @@ htmlcov/
 *.log
 launchagent*.log
 nohup.out
+.venv/
+seen_announcements.json.corrupt
