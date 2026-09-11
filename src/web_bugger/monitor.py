@@ -168,9 +168,7 @@ class Monitor:
         """连续抓取失败达到阈值时发送告警邮件"""
         if result.ok:
             if self._consecutive_failures:
-                logger.info(
-                    "抓取已恢复正常（此前连续失败 %d 次）", self._consecutive_failures
-                )
+                logger.info("抓取已恢复正常（此前连续失败 %d 次）", self._consecutive_failures)
             self._consecutive_failures = 0
             return
 

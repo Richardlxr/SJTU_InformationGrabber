@@ -62,9 +62,7 @@ class TestCorruptFile:
         assert not path.exists()
 
     @pytest.mark.parametrize("content", ["null", "{}", '{"a": 1}', '"str"', "42"])
-    def test_valid_json_with_wrong_shape_is_handled(
-        self, tmp_path: Path, content: str
-    ) -> None:
+    def test_valid_json_with_wrong_shape_is_handled(self, tmp_path: Path, content: str) -> None:
         """合法 JSON 但顶层不是数组时不能抛 TypeError 崩溃启动"""
         path = tmp_path / "weird.json"
         path.write_text(content, encoding="utf-8")
@@ -80,9 +78,7 @@ class TestCorruptFile:
         assert s.seen_urls == frozenset()
         assert not (tmp_path / "weird.json.corrupt").exists()
 
-    def test_blank_file_is_treated_as_empty_without_quarantine(
-        self, tmp_path: Path
-    ) -> None:
+    def test_blank_file_is_treated_as_empty_without_quarantine(self, tmp_path: Path) -> None:
         path = tmp_path / "blank.json"
         path.write_text("", encoding="utf-8")
         s = Storage(path)
@@ -91,9 +87,7 @@ class TestCorruptFile:
 
     def test_non_string_entries_are_ignored(self, tmp_path: Path) -> None:
         path = tmp_path / "mixed.json"
-        path.write_text(
-            json.dumps(["https://a.com/1", 42, None, "", {"x": 1}]), encoding="utf-8"
-        )
+        path.write_text(json.dumps(["https://a.com/1", 42, None, "", {"x": 1}]), encoding="utf-8")
         s = Storage(path)
         assert s.seen_urls == {"https://a.com/1"}
 

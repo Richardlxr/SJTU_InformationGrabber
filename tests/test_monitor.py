@@ -85,9 +85,7 @@ class TestDryRun:
 
         assert monitor.check_once(dry_run=True) == 1
         assert notifier.sent == [], "dry-run 不应该发邮件"
-        assert not (tmp_path / "seen_announcements.json").exists(), (
-            "dry-run 不应该写入已读状态"
-        )
+        assert not (tmp_path / "seen_announcements.json").exists(), "dry-run 不应该写入已读状态"
 
         # 关键：dry-run 之后真实运行仍应发现同一条公告
         assert monitor.check_once() == 1

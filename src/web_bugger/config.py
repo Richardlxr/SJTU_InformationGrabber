@@ -29,13 +29,9 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     try:
         value = int(raw.strip())
     except ValueError as e:
-        raise ConfigError(
-            f"环境变量 {name} 必须是整数，当前值为 {raw!r}"
-        ) from e
+        raise ConfigError(f"环境变量 {name} 必须是整数，当前值为 {raw!r}") from e
     if not minimum <= value <= maximum:
-        raise ConfigError(
-            f"环境变量 {name} 必须在 [{minimum}, {maximum}] 之间，当前值为 {value}"
-        )
+        raise ConfigError(f"环境变量 {name} 必须在 [{minimum}, {maximum}] 之间，当前值为 {value}")
     return value
 
 
@@ -194,8 +190,6 @@ class AppConfig:
             smtp=smtp,
             scraper=scraper,
             check_interval=_env_int("CHECK_INTERVAL", 300, minimum=10, maximum=86400),
-            failure_alert_threshold=_env_int(
-                "FAILURE_ALERT_THRESHOLD", 3, minimum=1, maximum=100
-            ),
+            failure_alert_threshold=_env_int("FAILURE_ALERT_THRESHOLD", 3, minimum=1, maximum=100),
             data_dir=_default_data_dir(),
         )

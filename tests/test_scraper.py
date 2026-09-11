@@ -79,7 +79,7 @@ SAMPLE_CS_SHELL = """
 
 def _cs_item(href: str, title: str, day: str = "09", ym: str = "2026-05") -> str:
     return (
-        "<li><a href=\"" + href + "\">"
+        '<li><a href="' + href + '">'
         f'<div class="time"><p>{day}</p><span>{ym}</span></div>'
         '<div class="line"></div>'
         f'<div class="tit line-2">{title}</div>'
@@ -119,9 +119,7 @@ class FakeSession:
         items = self.pages.get(page)
         if items is None:
             return FakeJsonResponse({"content": "", "page": page, "count": self.count})
-        return FakeJsonResponse(
-            {"content": "".join(items), "page": page, "count": self.count}
-        )
+        return FakeJsonResponse({"content": "".join(items), "page": page, "count": self.count})
 
     def get(self, url: str, **kwargs: Any) -> Any:
         raise requests.ConnectionError("测试环境不联网")
@@ -143,9 +141,7 @@ class TestScraperXwtg:
 
     def test_parse_sample_html(self) -> None:
         scraper = _scraper(base_url="https://jwc.sjtu.edu.cn/")
-        results = scraper._parse(
-            SAMPLE_XWTG_HTML, "https://jwc.sjtu.edu.cn/xwtg.htm"
-        )
+        results = scraper._parse(SAMPLE_XWTG_HTML, "https://jwc.sjtu.edu.cn/xwtg.htm")
 
         # 无效 href（#、javascript:、缺失）被跳过
         assert len(results) == 3
@@ -161,9 +157,7 @@ class TestScraperXwtg:
     def test_relative_url_uses_page_url_not_global_base(self) -> None:
         """页面来自非 jwc 域名时，相对链接必须按该页面解析"""
         scraper = _scraper(base_url="https://jwc.sjtu.edu.cn/")
-        results = scraper._parse(
-            SAMPLE_XWTG_HTML, "https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html"
-        )
+        results = scraper._parse(SAMPLE_XWTG_HTML, "https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html")
         assert results[0].url == "https://cs.sjtu.edu.cn/info/1025/1001.htm"
 
 
@@ -172,9 +166,7 @@ class TestScraperMxxsdtz:
 
     def test_parse_sample_html(self) -> None:
         scraper = _scraper(base_url="https://jwc.sjtu.edu.cn/")
-        results = scraper._parse(
-            SAMPLE_MXXSDTZ_HTML, "https://jwc.sjtu.edu.cn/index/mxxsdtz.htm"
-        )
+        results = scraper._parse(SAMPLE_MXXSDTZ_HTML, "https://jwc.sjtu.edu.cn/index/mxxsdtz.htm")
 
         assert len(results) == 2
         assert results[0].title == "关于 2026 年春季选课的通知"
@@ -375,17 +367,13 @@ class TestFetchWithStatus:
         assert result.pages_total == 0
         assert result.all_failed is False
 
-    def test_fetch_wrapper_returns_items_only(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_fetch_wrapper_returns_items_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
         scraper = _scraper()
         monkeypatch.setattr(scraper, "_download", lambda url: SAMPLE_XWTG_HTML)
         items = scraper.fetch()
         assert len(items) == 3
 
-    def test_dedup_across_pages_and_stable_order(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_dedup_across_pages_and_stable_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def block(url: str, title: str) -> str:
             return (
                 '<div class="w50l"><div class="nytit2"><h2>S</h2></div>'
@@ -476,8 +464,7 @@ class TestHelpers:
 
     def test_normalize_href_accepts_relative_and_absolute(self) -> None:
         assert (
-            Scraper._normalize_href("a/b.htm", "https://x.com/dir/")
-            == "https://x.com/dir/a/b.htm"
+            Scraper._normalize_href("a/b.htm", "https://x.com/dir/") == "https://x.com/dir/a/b.htm"
         )
         assert Scraper._normalize_href("https://y.com/z", "https://x.com/") == "https://y.com/z"
 

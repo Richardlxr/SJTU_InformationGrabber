@@ -40,9 +40,7 @@ class FakeMonitor:
 
 
 @pytest.fixture
-def harness(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> Callable[..., FakeMonitor]:
+def harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Callable[..., FakeMonitor]:
     """把 cli 的 AppConfig / Monitor 换成本地假对象，返回一个 install() 工厂"""
     config = AppConfig(scraper=ScraperConfig(target_urls=[]), data_dir=tmp_path)
     monkeypatch.setattr(

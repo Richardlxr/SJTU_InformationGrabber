@@ -47,9 +47,7 @@ def _write_env(tmp_path: Path, content: str) -> Path:
 class TestSmtpConfig:
     def test_is_configured(self) -> None:
         assert SmtpConfig().is_configured is False
-        cfg = SmtpConfig(
-            sender_email="a@qq.com", sender_password="x", receiver_email="b@qq.com"
-        )
+        cfg = SmtpConfig(sender_email="a@qq.com", sender_password="x", receiver_email="b@qq.com")
         assert cfg.is_configured is True
 
     def test_recipients_single(self) -> None:
@@ -144,9 +142,7 @@ class TestFromEnv:
         with pytest.raises(ConfigError, match=match):
             AppConfig.from_env(_write_env(tmp_path, content))
 
-    def test_bool_parsing(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_bool_parsing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         for raw, expected in [
             ("true", True),
             ("TRUE", True),

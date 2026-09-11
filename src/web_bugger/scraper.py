@@ -159,18 +159,14 @@ class Scraper:
                     all_items.append(item)
 
         if failed:
-            logger.warning(
-                "%d/%d 个页面抓取失败: %s", len(failed), len(urls), ", ".join(failed)
-            )
+            logger.warning("%d/%d 个页面抓取失败: %s", len(failed), len(urls), ", ".join(failed))
         logger.info(
             "共抓取到 %d 条公告（来自 %d 个页面，成功 %d 个）",
             len(all_items),
             len(urls),
             len(urls) - len(failed),
         )
-        return FetchResult(
-            items=all_items, pages_total=len(urls), failed_urls=tuple(failed)
-        )
+        return FetchResult(items=all_items, pages_total=len(urls), failed_urls=tuple(failed))
 
     def _fetch_one(self, url: str) -> list[Announcement] | None:
         """下载并解析单个页面；失败返回 None"""
@@ -245,9 +241,7 @@ class Scraper:
     # 布局 C — cs.sjtu.edu.cn 计算机学院 AJAX 列表式
     # ------------------------------------------------------------------
 
-    def _parse_cs_sjtu(
-        self, html: str, soup: BeautifulSoup, page_url: str
-    ) -> list[Announcement]:
+    def _parse_cs_sjtu(self, html: str, soup: BeautifulSoup, page_url: str) -> list[Announcement]:
         """
         页面使用 AJAX POST 接口动态加载通知列表：
           POST https://cs.sjtu.edu.cn/active/ajax_type_list.html
@@ -303,9 +297,7 @@ class Scraper:
                 resp.raise_for_status()
                 data = resp.json()
             except (requests.RequestException, ValueError) as e:
-                logger.error(
-                    "cs.sjtu AJAX 请求失败 (cat=%s, page=%d): %s", cat_code, page, e
-                )
+                logger.error("cs.sjtu AJAX 请求失败 (cat=%s, page=%d): %s", cat_code, page, e)
                 break
 
             if not isinstance(data, dict):
@@ -344,9 +336,7 @@ class Scraper:
         return results
 
     @classmethod
-    def _parse_cs_sjtu_item(
-        cls, item: Tag, section: str, base_url: str
-    ) -> Announcement | None:
+    def _parse_cs_sjtu_item(cls, item: Tag, section: str, base_url: str) -> Announcement | None:
         """
         HTML 结构:
           <li>
@@ -403,9 +393,7 @@ class Scraper:
         return tag.get_text(strip=True) if tag else "未知板块"
 
     @classmethod
-    def _parse_xwtg_item(
-        cls, item: Tag, section: str, base_url: str
-    ) -> Announcement | None:
+    def _parse_xwtg_item(cls, item: Tag, section: str, base_url: str) -> Announcement | None:
         link_tag = item.select_one("a")
         if link_tag is None:
             return None
@@ -452,9 +440,7 @@ class Scraper:
         return results
 
     @classmethod
-    def _parse_mxxsdtz_item(
-        cls, item: Tag, section: str, base_url: str
-    ) -> Announcement | None:
+    def _parse_mxxsdtz_item(cls, item: Tag, section: str, base_url: str) -> Announcement | None:
         wz = item.select_one("div.wz")
         if wz is None:
             return None

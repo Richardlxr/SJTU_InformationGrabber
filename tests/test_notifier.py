@@ -138,7 +138,7 @@ class TestTemplates:
         assert "<2026级>" not in html, "标题中的 HTML 必须被转义"
         assert "&lt;2026级&gt;" in html
         assert "&amp;" in html
-        assert 'a=1&b=2' not in html, "URL 中的 & 必须被转义"
+        assert "a=1&b=2" not in html, "URL 中的 & 必须被转义"
         assert "<b>S</b>" not in html
 
     def test_render_html_handles_empty_list(self) -> None:
@@ -159,9 +159,7 @@ class TestBuildMessage:
         assert subject.startswith("=?utf-8?"), "中文主题必须做 RFC2047 编码"
 
     def test_multiple_recipients(self) -> None:
-        msg = Notifier(_configured(receiver_email="a@qq.com, b@qq.com"))._build_message(
-            _items()
-        )
+        msg = Notifier(_configured(receiver_email="a@qq.com, b@qq.com"))._build_message(_items())
         assert msg["To"] == "a@qq.com, b@qq.com"
         assert Parser().parsestr(msg.as_string())["To"] == "a@qq.com, b@qq.com"
 
@@ -224,9 +222,7 @@ class TestDeliver:
         _install_server(monkeypatch, login_error=error)
         assert Notifier(_configured()).send(_items()) is False
 
-    def test_sendmail_error_returns_false_and_quits(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_sendmail_error_returns_false_and_quits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         server = _install_server(monkeypatch, send_error=smtplib.SMTPServerDisconnected("gone"))
         assert Notifier(_configured()).send(_items()) is False
         assert server.quit_called is True
