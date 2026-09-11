@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from types import TracebackType
+from typing import Any
 from urllib.parse import urljoin
 
 import requests
@@ -31,6 +33,17 @@ logger = logging.getLogger(__name__)
 _UNTRUSTED_ENCODINGS = {"", "iso-8859-1", "latin-1", "ascii", "us-ascii"}
 
 _INVALID_HREF_PREFIXES = ("#", "javascript:", "mailto:", "tel:")
+
+# 布局 D: zhiyuan.sjtu.edu.cn 致远学院 AJAX 接口
+_ZHIYUAN_API_BASE = "https://zhiyuan.sjtu.edu.cn/api/"
+_ZHIYUAN_VIEW_BASE = "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/"
+_ZHIYUAN_PAGE_SIZE = 50
+# 这两个接口历史很深（通知 1141 条 / 活动 637 条），而新条目永远排在最前，
+# 所以只取最近几页即可：既覆盖新公告，又不必每轮拉全量历史。
+_ZHIYUAN_RECENT_PAGES = 2
+# 活动分类 523 的详情不在本院站点，而在 ins.sjtu.edu.cn（与官网 JS 一致）
+_ZHIYUAN_INS_CATEGORY = 523
+_ZHIYUAN_INS_BASE = "https://ins.sjtu.edu.cn/seminars/"
 
 
 @dataclass(frozen=True)
@@ -224,6 +237,12 @@ class Scraper:
         if soup.select_one("div#article_list") is not None:
             return self._parse_cs_sjtu(html, soup, page_url)
 
+        # 布局 D: zhiyuan.sjtu.edu.cn 致远学院 AJAX 动态加载列表
+        if soup.select_one("div.events-list") is not None:
+            return self._parse_zhiyuan_events(page_url)
+        if soup.select_one("div.announcement-list") is not None:
+            return self._parse_zhiyuan_announcements(page_url)
+
         # 布局 A: xwtg.htm 板块式（多个 div.w50l / div.w50r，每个含 Newslist1）
         sections = soup.select("div.w50l, div.w50r")
         if sections:
@@ -369,6 +388,139 @@ class Scraper:
             date = f"{ym}-{day}" if ym else ""
 
         return Announcement(title=title, url=url, date=date, section=section)
+
+    # ------------------------------------------------------------------
+    # 布局 D — zhiyuan.sjtu.edu.cn 致远学院 AJAX 列表式
+    # ------------------------------------------------------------------
+
+    def _parse_zhiyuan_events(self, page_url: str) -> list[Announcement]:
+        """讲座/活动：GET /api/get_event_by_category"""
+        return self._fetch_zhiyuan_pages(
+            endpoint="get_event_by_category",
+            list_key="events",
+            section="致远讲座活动",
+            parse_item=self._zhiyuan_event_item,
+            extra_params={"active": 0},
+            referer=page_url,
+        )
+
+    def _parse_zhiyuan_announcements(self, page_url: str) -> list[Announcement]:
+        """通知公告：GET /api/get_announcements_by_category"""
+        return self._fetch_zhiyuan_pages(
+            endpoint="get_announcements_by_category",
+            list_key="announcements",
+            section="致远通知公告",
+            parse_item=self._zhiyuan_announcement_item,
+            extra_params={},
+            referer=page_url,
+        )
+
+    def _fetch_zhiyuan_pages(
+        self,
+        *,
+        endpoint: str,
+        list_key: str,
+        section: str,
+        parse_item: Callable[[dict[str, Any], str], Announcement | None],
+        extra_params: dict[str, Any],
+        referer: str,
+    ) -> list[Announcement]:
+        """分页读取致远学院 JSON 接口（只取最近若干页，见 _ZHIYUAN_RECENT_PAGES）"""
+        results: list[Announcement] = []
+        seen_urls: set[str] = set()
+        max_pages = max(1, min(self._config.max_pages, _ZHIYUAN_RECENT_PAGES))
+
+        for page in range(1, max_pages + 1):
+            params: dict[str, Any] = {
+                "num": _ZHIYUAN_PAGE_SIZE,
+                "category": -1,
+                "page": page,
+                **extra_params,
+            }
+            try:
+                resp = self._session.get(
+                    f"{_ZHIYUAN_API_BASE}{endpoint}",
+                    params=params,
+                    timeout=self._config.request_timeout,
+                    headers={"Referer": referer, "X-Requested-With": "XMLHttpRequest"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except (requests.RequestException, ValueError) as e:
+                logger.error(
+                    "zhiyuan AJAX 请求失败 (%s, page=%d): %s", endpoint, page, e
+                )
+                break
+
+            if not isinstance(data, dict) or data.get("status") != 200:
+                logger.error(
+                    "zhiyuan AJAX 返回异常 (%s, page=%d): %r", endpoint, page, data
+                )
+                break
+
+            raw_items = data.get(list_key)
+            if not isinstance(raw_items, list):
+                break
+            # 接口偶尔会混入 null 元素（如 announcements 数组）
+            items = [it for it in raw_items if isinstance(it, dict)]
+            if not items:
+                break
+
+            for it in items:
+                ann = parse_item(it, section)
+                if ann is not None and ann.url not in seen_urls:
+                    seen_urls.add(ann.url)
+                    results.append(ann)
+
+            if len(items) < _ZHIYUAN_PAGE_SIZE:
+                break  # 已是最后一页
+
+        logger.debug("zhiyuan [%s] 共抓取 %d 条", section, len(results))
+        return results
+
+    @staticmethod
+    def _zhiyuan_title(item: dict[str, Any]) -> str:
+        return str(item.get("cn_title") or item.get("en_title") or "").strip()
+
+    @staticmethod
+    def _zhiyuan_date(raw: Any) -> str:
+        """'2026-09-10 15:14:31' -> '2026-09-10'"""
+        text = str(raw or "").strip()
+        return text[:10] if len(text) >= 10 else text
+
+    @classmethod
+    def _zhiyuan_announcement_item(
+        cls, item: dict[str, Any], section: str
+    ) -> Announcement | None:
+        title = cls._zhiyuan_title(item)
+        item_id = item.get("id")
+        if not title or item_id is None:
+            return None
+        return Announcement(
+            title=title,
+            url=urljoin(_ZHIYUAN_VIEW_BASE, f"announcement_view.php?id={item_id}"),
+            date=cls._zhiyuan_date(item.get("publish_time")),
+            section=section,
+        )
+
+    @classmethod
+    def _zhiyuan_event_item(
+        cls, item: dict[str, Any], section: str
+    ) -> Announcement | None:
+        title = cls._zhiyuan_title(item)
+        event_id = item.get("announcement_id") or item.get("id")
+        if not title or event_id is None:
+            return None
+        if item.get("announce_category_id") == _ZHIYUAN_INS_CATEGORY:
+            url = f"{_ZHIYUAN_INS_BASE}{event_id}"
+        else:
+            url = urljoin(_ZHIYUAN_VIEW_BASE, f"event_view.php?id={event_id}")
+        return Announcement(
+            title=title,
+            url=url,
+            date=cls._zhiyuan_date(item.get("date")),
+            section=section,
+        )
 
     # ------------------------------------------------------------------
     # 布局 A — xwtg.htm 板块式

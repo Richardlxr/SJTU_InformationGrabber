@@ -77,6 +77,56 @@ SAMPLE_CS_SHELL = """
 """
 
 
+# 布局 D —— zhiyuan.sjtu.edu.cn 致远学院（AJAX 空容器 + JSON 接口）
+SAMPLE_ZHIYUAN_EVENTS_SHELL = """
+<html><body>
+<div class="events-list"></div>
+<div class="pages" id="pages"></div>
+</body></html>
+"""
+
+SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL = """
+<html><body>
+<div class="announcement-list"></div>
+<div class="pages" id="pages"></div>
+</body></html>
+"""
+
+ZHIYUAN_ANNOUNCEMENTS_URL = (
+    "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/announcement_list.php"
+)
+ZHIYUAN_EVENTS_URL = "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/events_list.php"
+
+
+def _zhiyuan_ann(
+    ann_id: int,
+    title: str,
+    publish_time: str = "2026-09-10 15:14:31",
+    category: int = 6,
+) -> dict[str, Any]:
+    return {
+        "id": ann_id,
+        "cn_title": title,
+        "publish_time": publish_time,
+        "announce_category_id": category,
+    }
+
+
+def _zhiyuan_event(
+    event_id: int,
+    title: str,
+    date: str = "2026-06-10 16:00:00",
+    category: int = 3,
+) -> dict[str, Any]:
+    return {
+        "id": event_id,
+        "announcement_id": event_id,
+        "cn_title": title,
+        "date": date,
+        "announce_category_id": category,
+    }
+
+
 def _cs_item(href: str, title: str, day: str = "09", ym: str = "2026-05") -> str:
     return (
         '<li><a href="' + href + '">'
@@ -123,6 +173,29 @@ class FakeSession:
 
     def get(self, url: str, **kwargs: Any) -> Any:
         raise requests.ConnectionError("测试环境不联网")
+
+    def close(self) -> None:
+        pass
+
+
+class FakeJsonGetSession:
+    """zhiyuan 接口走 GET + params，按 page 返回预设 JSON"""
+
+    def __init__(self, pages: dict[int, dict[str, Any]], list_key: str) -> None:
+        self.pages = pages
+        self.list_key = list_key
+        self.get_calls: list[dict[str, Any]] = []
+
+    def get(self, url: str, **kwargs: Any) -> FakeJsonResponse:
+        params = kwargs.get("params") or {}
+        page = int(params["page"])
+        self.get_calls.append({"url": url, "params": params, "headers": kwargs.get("headers")})
+        payload = self.pages.get(page)
+        if payload is None:
+            return FakeJsonResponse(
+                {"status": 200, self.list_key: [], "total": 0, "count": 0, "pages": 0}
+            )
+        return FakeJsonResponse(payload)
 
     def close(self) -> None:
         pass
@@ -439,6 +512,270 @@ class TestDecode:
     def test_falls_back_to_text_without_detection(self) -> None:
         resp = self._Resp(None, "中文", None)
         assert Scraper._decode(cast(Any, resp)) == "中文"
+
+
+class TestScraperZhiyuan:
+    """布局 D: zhiyuan.sjtu.edu.cn 致远学院 AJAX 列表"""
+
+    def _install(self, scraper: Scraper, session: Any) -> None:
+        setattr(scraper, "_session", session)  # noqa: B010 - 测试替身注入
+
+    def test_announcements_parsed_and_nulls_skipped(self) -> None:
+        scraper = _scraper()
+        session = FakeJsonGetSession(
+            {
+                1: {
+                    "status": 200,
+                    "total": 2,
+                    "pages": 1,
+                    "announcements": [
+                        None,
+                        _zhiyuan_ann(4810, "致远学院2026-2027学年秋季学期通识课程介绍"),
+                    ],
+                }
+            },
+            list_key="announcements",
+        )
+        self._install(scraper, session)
+
+        results = scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
+
+        assert len(results) == 1, "null 元素应被跳过"
+        assert results[0].section == "致远通知公告"
+        assert results[0].date == "2026-09-10"
+        assert results[0].url == (
+            "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/announcement_view.php?id=4810"
+        )
+
+    def test_announcement_request_params(self) -> None:
+        scraper = _scraper()
+        session = FakeJsonGetSession(
+            {1: {"status": 200, "total": 1, "announcements": [_zhiyuan_ann(1, "标题")]}},
+            list_key="announcements",
+        )
+        self._install(scraper, session)
+        scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
+
+        call = session.get_calls[0]
+        assert call["url"] == (
+            "https://zhiyuan.sjtu.edu.cn/api/get_announcements_by_category"
+        )
+        assert call["params"] == {"num": 50, "category": -1, "page": 1}
+        assert call["headers"]["X-Requested-With"] == "XMLHttpRequest"
+
+    def test_events_parsed_with_active_param(self) -> None:
+        scraper = _scraper()
+        session = FakeJsonGetSession(
+            {
+                1: {
+                    "status": 200,
+                    "count": 1,
+                    "pages": 1,
+                    "events": [_zhiyuan_event(4817, "ZY-INS沙龙 No.314|海洋机器人智能与仿生")],
+                }
+            },
+            list_key="events",
+        )
+        self._install(scraper, session)
+
+        results = scraper._parse(SAMPLE_ZHIYUAN_EVENTS_SHELL, ZHIYUAN_EVENTS_URL)
+
+        assert len(results) == 1
+        assert results[0].section == "致远讲座活动"
+        assert results[0].date == "2026-06-10", "活动用 date（活动时间）"
+        assert results[0].url == (
+            "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/event_view.php?id=4817"
+        )
+        call = session.get_calls[0]
+        assert call["url"] == "https://zhiyuan.sjtu.edu.cn/api/get_event_by_category"
+        assert call["params"]["active"] == 0
+
+    def test_event_in_ins_category_uses_external_site(self) -> None:
+        scraper = _scraper()
+        session = FakeJsonGetSession(
+            {
+                1: {
+                    "status": 200,
+                    "count": 1,
+                    "events": [_zhiyuan_event(4817, "INS 研讨会", category=523)],
+                }
+            },
+            list_key="events",
+        )
+        self._install(scraper, session)
+        results = scraper._parse(SAMPLE_ZHIYUAN_EVENTS_SHELL, ZHIYUAN_EVENTS_URL)
+        assert results[0].url == "https://ins.sjtu.edu.cn/seminars/4817"
+
+    def test_items_without_title_or_id_skipped(self) -> None:
+        scraper = _scraper()
+        session = FakeJsonGetSession(
+            {
+                1: {
+                    "status": 200,
+                    "total": 4,
+                    "announcements": [
+                        _zhiyuan_ann(1, ""),
+                        {"id": None, "cn_title": "没有 id"},
+                        {"cn_title": "没有 id 字段"},
+                        _zhiyuan_ann(2, "有效标题"),
+                    ],
+                }
+            },
+            list_key="announcements",
+        )
+        self._install(scraper, session)
+        results = scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
+        assert [r.title for r in results] == ["有效标题"]
+
+    def test_english_title_fallback(self) -> None:
+        scraper = _scraper()
+        session = FakeJsonGetSession(
+            {
+                1: {
+                    "status": 200,
+                    "announcements": [
+                        {
+                            "id": 7,
+                            "cn_title": "",
+                            "en_title": "English Only Title",
+                            "publish_time": "2026-01-02 03:04:05",
+                        }
+                    ],
+                }
+            },
+            list_key="announcements",
+        )
+        self._install(scraper, session)
+        results = scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
+        assert results[0].title == "English Only Title"
+
+    def test_stops_after_recent_pages(self) -> None:
+        """历史很深，必须只取最近 _ZHIYUAN_RECENT_PAGES 页"""
+        scraper = _scraper()
+        full_page = {
+            "status": 200,
+            "total": 1141,
+            "pages": 23,
+            "announcements": [_zhiyuan_ann(i, f"通知{i}") for i in range(50)],
+        }
+        session = FakeJsonGetSession({p: full_page for p in range(1, 30)}, list_key="announcements")
+        self._install(scraper, session)
+
+        results = scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
+
+        assert len(session.get_calls) == 2, "应只请求最近 2 页"
+        assert [c["params"]["page"] for c in session.get_calls] == [1, 2]
+        # 两页内容相同 -> 按 URL 去重
+        assert len(results) == 50
+
+    def test_stops_early_when_page_not_full(self) -> None:
+        scraper = _scraper()
+        page1 = {
+            "status": 200,
+            "total": 3,
+            "announcements": [_zhiyuan_ann(i, f"通知{i}") for i in range(3)],
+        }
+        page2 = {
+            "status": 200,
+            "total": 3,
+            "announcements": [_zhiyuan_ann(99, "不该被请求")],
+        }
+        session = FakeJsonGetSession({1: page1, 2: page2}, list_key="announcements")
+        self._install(scraper, session)
+
+        results = scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
+
+        assert len(session.get_calls) == 1, "未满一页说明已到末页，无需再请求"
+        assert len(results) == 3
+
+    def test_duplicate_urls_deduped(self) -> None:
+        scraper = _scraper()
+        item = _zhiyuan_ann(4810, "重复通知")
+        session = FakeJsonGetSession(
+            {
+                1: {"status": 200, "total": 2, "announcements": [item, dict(item)]},
+            },
+            list_key="announcements",
+        )
+        self._install(scraper, session)
+        results = scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
+        assert len(results) == 1
+
+    def test_status_not_200_returns_empty(self) -> None:
+        scraper = _scraper()
+        session = FakeJsonGetSession(
+            {1: {"status": 500, "message": "boom"}}, list_key="announcements"
+        )
+        self._install(scraper, session)
+        assert scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL) == []
+
+    def test_non_list_payload_returns_empty(self) -> None:
+        scraper = _scraper()
+        session = FakeJsonGetSession(
+            {1: {"status": 200, "announcements": "not-a-list"}},
+            list_key="announcements",
+        )
+        self._install(scraper, session)
+        assert scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL) == []
+
+    def test_empty_first_page_returns_empty(self) -> None:
+        scraper = _scraper()
+        session = FakeJsonGetSession({}, list_key="events")
+        self._install(scraper, session)
+        assert scraper._parse(SAMPLE_ZHIYUAN_EVENTS_SHELL, ZHIYUAN_EVENTS_URL) == []
+
+    def test_request_failure_is_swallowed(self) -> None:
+        scraper = _scraper()
+
+        class Boom:
+            def get(self, url: str, **kwargs: Any) -> Any:
+                raise requests.ConnectionError("boom")
+
+        self._install(scraper, Boom())
+        assert scraper._parse(SAMPLE_ZHIYUAN_EVENTS_SHELL, ZHIYUAN_EVENTS_URL) == []
+
+    def test_max_pages_config_lowers_cap(self) -> None:
+        scraper = _scraper(max_pages=1)
+        full_page = {
+            "status": 200,
+            "total": 999,
+            "announcements": [_zhiyuan_ann(i, f"通知{i}") for i in range(50)],
+        }
+        session = FakeJsonGetSession({1: full_page, 2: full_page}, list_key="announcements")
+        self._install(scraper, session)
+        scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
+        assert len(session.get_calls) == 1
+
+    def test_dispatch_routes_by_container(self) -> None:
+        """_parse 应根据容器 class 选择对应接口"""
+        scraper = _scraper()
+        ann_session = FakeJsonGetSession(
+            {1: {"status": 200, "total": 1, "announcements": [_zhiyuan_ann(1, "通知")]}},
+            list_key="announcements",
+        )
+        self._install(scraper, ann_session)
+        parsed = scraper._parse(
+            SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL
+        )
+        assert len(parsed) == 1
+        assert "get_announcements" in ann_session.get_calls[0]["url"]
+
+        ev_session = FakeJsonGetSession(
+            {1: {"status": 200, "count": 1, "events": [_zhiyuan_event(2, "活动")]}},
+            list_key="events",
+        )
+        self._install(scraper, ev_session)
+        assert len(scraper._parse(SAMPLE_ZHIYUAN_EVENTS_SHELL, ZHIYUAN_EVENTS_URL)) == 1
+        assert "get_event" in ev_session.get_calls[0]["url"]
+
+    def test_config_default_urls_include_zhiyuan(self) -> None:
+        from web_bugger.config import ScraperConfig
+
+        urls = ScraperConfig().target_urls
+        assert ZHIYUAN_EVENTS_URL in urls
+        assert ZHIYUAN_ANNOUNCEMENTS_URL in urls
+        assert "https://jwc.sjtu.edu.cn/xwtg.htm" not in urls, "新闻通告应已移除"
+        assert "https://jwc.sjtu.edu.cn/index/mxxsdtz.htm" in urls
 
 
 class TestHelpers:

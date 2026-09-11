@@ -99,13 +99,16 @@ class ScraperConfig:
 
     target_urls: list[str] = field(
         default_factory=lambda: [
-            "https://jwc.sjtu.edu.cn/xwtg.htm",
+            # 教务处「面向学生的通知」（选课 / 考试 / 竞赛等）
             "https://jwc.sjtu.edu.cn/index/mxxsdtz.htm",
             # 计算机学院学生工作通知公告（党建德育 / 团学工作 / 学生事务 / 职业发展）
             "https://cs.sjtu.edu.cn/xsgz-tzgg-djdy.html",
             "https://cs.sjtu.edu.cn/xsgz-tzgg-txgz.html",
             "https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html",
             "https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html",
+            # 致远学院（讲座活动 / 通知公告，AJAX 接口）
+            "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/events_list.php",
+            "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/announcement_list.php",
         ]
     )
     base_url: str = "https://jwc.sjtu.edu.cn/"

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from web_bugger.config import AppConfig, ConfigError, SmtpConfig
+from web_bugger.config import AppConfig, ConfigError, ScraperConfig, SmtpConfig
 
 _ENV_KEYS = [
     "SMTP_SERVER",
@@ -110,7 +110,7 @@ class TestFromEnv:
     def test_empty_target_urls_falls_back_to_defaults(self, tmp_path: Path) -> None:
         env = _write_env(tmp_path, "TARGET_URLS=  ,  ,")
         cfg = AppConfig.from_env(env)
-        assert len(cfg.scraper.target_urls) == 6
+        assert cfg.scraper.target_urls == ScraperConfig().target_urls
 
     def test_defaults_when_env_file_is_almost_empty(self, tmp_path: Path) -> None:
         cfg = AppConfig.from_env(_write_env(tmp_path, "# nothing here\n"))

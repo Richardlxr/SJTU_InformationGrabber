@@ -5,11 +5,11 @@
 [![Python](https://img.shields.io/badge/python-≥3.10-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-自动监控 [上海交通大学教务处](https://jwc.sjtu.edu.cn/) 网站公告页面，发现新公告时通过邮件通知。
+自动监控 [上海交通大学教务处](https://jwc.sjtu.edu.cn/)、[计算机学院](https://cs.sjtu.edu.cn/)、[致远学院](https://zhiyuan.sjtu.edu.cn/) 的公告页面，发现新公告时通过邮件通知。
 
 ## 功能
 
-- 🔍 同时监控多个页面（新闻通告 + 面向学生的通知），自动去重
+- 🔍 同时监控 7 个页面（教务处 + 计算机学院 4 个板块 + 致远学院 2 个板块），自动去重
 - 📧 发现新公告自动发送 HTML 格式邮件（含标题、链接、板块、日期）
 - 💾 本地 JSON 持久化存储已读公告，避免重复通知
 - 🔄 支持守护模式持续运行 / 单次检查 / 仅打印
@@ -19,8 +19,17 @@
 
 | 页面 | 板块 |
 |------|------|
-| [新闻通告](https://jwc.sjtu.edu.cn/xwtg.htm) | 新闻中心、质控办、教学运行、注册学务、研究办、教学质量、综合办、语言文字、工会与支部、非学历教育管理办公室 |
-| [面向学生的通知](https://jwc.sjtu.edu.cn/index/mxxsdtz.htm) | 选课、考试、竞赛、助管招聘等学生相关通知 |
+| [教务处 · 面向学生的通知](https://jwc.sjtu.edu.cn/index/mxxsdtz.htm) | 选课、考试、竞赛、助管招聘等学生相关通知 |
+| [计算机学院 · 党建德育](https://cs.sjtu.edu.cn/xsgz-tzgg-djdy.html) | 党建德育 |
+| [计算机学院 · 团学工作](https://cs.sjtu.edu.cn/xsgz-tzgg-txgz.html) | 团学工作 |
+| [计算机学院 · 学生事务](https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html) | 学生事务 |
+| [计算机学院 · 职业发展](https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html) | 职业发展 |
+| [致远学院 · 讲座活动](https://zhiyuan.sjtu.edu.cn/html/zhiyuan/events_list.php) | ZY-INS 沙龙、学术报告、未来学者项目等 |
+| [致远学院 · 通知公告](https://zhiyuan.sjtu.edu.cn/html/zhiyuan/announcement_list.php) | 学院通知公告（通识课程、招生报名、综合测评等） |
+
+> 致远学院两个页面是 JS/AJAX 渲染的，直接解析其 JSON 接口（`/api/get_*`）。
+> 这两个接口历史很深（通知 1000+ 条、活动 600+ 条），而新条目总排在最前，
+> 因此只抓取最近 2 页（每页 50 条），保留 `MAX_PAGES` 作为安全上限。
 
 ## 项目结构
 
