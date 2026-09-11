@@ -18,7 +18,7 @@
 ## 监控范围
 
 | 页面 | 板块 |
-|------|------|
+| ------ | ------ |
 | [教务处 · 面向学生的通知](https://jwc.sjtu.edu.cn/index/mxxsdtz.htm) | 选课、考试、竞赛、助管招聘等学生相关通知 |
 | [计算机学院 · 党建德育](https://cs.sjtu.edu.cn/xsgz-tzgg-djdy.html) | 党建德育 |
 | [计算机学院 · 团学工作](https://cs.sjtu.edu.cn/xsgz-tzgg-txgz.html) | 团学工作 |

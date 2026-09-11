@@ -92,9 +92,7 @@ SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL = """
 </body></html>
 """
 
-ZHIYUAN_ANNOUNCEMENTS_URL = (
-    "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/announcement_list.php"
-)
+ZHIYUAN_ANNOUNCEMENTS_URL = "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/announcement_list.php"
 ZHIYUAN_EVENTS_URL = "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/events_list.php"
 
 
@@ -557,9 +555,7 @@ class TestScraperZhiyuan:
         scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
 
         call = session.get_calls[0]
-        assert call["url"] == (
-            "https://zhiyuan.sjtu.edu.cn/api/get_announcements_by_category"
-        )
+        assert call["url"] == ("https://zhiyuan.sjtu.edu.cn/api/get_announcements_by_category")
         assert call["params"] == {"num": 50, "category": -1, "page": 1}
         assert call["headers"]["X-Requested-With"] == "XMLHttpRequest"
 
@@ -583,9 +579,7 @@ class TestScraperZhiyuan:
         assert len(results) == 1
         assert results[0].section == "致远讲座活动"
         assert results[0].date == "2026-06-10", "活动用 date（活动时间）"
-        assert results[0].url == (
-            "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/event_view.php?id=4817"
-        )
+        assert results[0].url == ("https://zhiyuan.sjtu.edu.cn/html/zhiyuan/event_view.php?id=4817")
         call = session.get_calls[0]
         assert call["url"] == "https://zhiyuan.sjtu.edu.cn/api/get_event_by_category"
         assert call["params"]["active"] == 0
@@ -754,9 +748,7 @@ class TestScraperZhiyuan:
             list_key="announcements",
         )
         self._install(scraper, ann_session)
-        parsed = scraper._parse(
-            SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL
-        )
+        parsed = scraper._parse(SAMPLE_ZHIYUAN_ANNOUNCEMENTS_SHELL, ZHIYUAN_ANNOUNCEMENTS_URL)
         assert len(parsed) == 1
         assert "get_announcements" in ann_session.get_calls[0]["url"]
 

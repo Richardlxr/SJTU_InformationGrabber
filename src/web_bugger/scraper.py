@@ -447,15 +447,11 @@ class Scraper:
                 resp.raise_for_status()
                 data = resp.json()
             except (requests.RequestException, ValueError) as e:
-                logger.error(
-                    "zhiyuan AJAX 请求失败 (%s, page=%d): %s", endpoint, page, e
-                )
+                logger.error("zhiyuan AJAX 请求失败 (%s, page=%d): %s", endpoint, page, e)
                 break
 
             if not isinstance(data, dict) or data.get("status") != 200:
-                logger.error(
-                    "zhiyuan AJAX 返回异常 (%s, page=%d): %r", endpoint, page, data
-                )
+                logger.error("zhiyuan AJAX 返回异常 (%s, page=%d): %r", endpoint, page, data)
                 break
 
             raw_items = data.get(list_key)
@@ -489,9 +485,7 @@ class Scraper:
         return text[:10] if len(text) >= 10 else text
 
     @classmethod
-    def _zhiyuan_announcement_item(
-        cls, item: dict[str, Any], section: str
-    ) -> Announcement | None:
+    def _zhiyuan_announcement_item(cls, item: dict[str, Any], section: str) -> Announcement | None:
         title = cls._zhiyuan_title(item)
         item_id = item.get("id")
         if not title or item_id is None:
@@ -504,9 +498,7 @@ class Scraper:
         )
 
     @classmethod
-    def _zhiyuan_event_item(
-        cls, item: dict[str, Any], section: str
-    ) -> Announcement | None:
+    def _zhiyuan_event_item(cls, item: dict[str, Any], section: str) -> Announcement | None:
         title = cls._zhiyuan_title(item)
         event_id = item.get("announcement_id") or item.get("id")
         if not title or event_id is None:
