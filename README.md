@@ -91,7 +91,8 @@ cp .env.example .env
 | `MAX_RETRIES` | | 单页面失败重试次数（默认 `3`） |
 | `MAX_WORKERS` | | 并发抓取页面数（默认 `4`） |
 | `MAX_PAGES` | | 单个 AJAX 板块最大翻页数（默认 `50`，防止死循环） |
-| `FAILURE_ALERT_THRESHOLD` | | 连续抓取失败多少次后发告警邮件（默认 `3`） |
+| `FAILURE_ALERT_THRESHOLD` | | 某个页面连续抓取失败多少次后发告警邮件（默认 `3`） |
+| `FAILURE_ALERT_INTERVAL` | | 同一页面持续失败时重复提醒的最小间隔秒数（默认 `86400` = 1 天；新出问题的页面会立即提醒） |
 
 > 所有数值型配置都会做范围校验：写错（例如 `SMTP_PORT=abc`）会得到一条带变量名的
 > 明确报错，而不是 Python 堆栈。

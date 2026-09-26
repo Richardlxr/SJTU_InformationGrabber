@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from typing import Protocol
 
+from web_bugger.alerts import FailureTracker
 from web_bugger.config import AppConfig
 from web_bugger.models import Announcement
 from web_bugger.notifier import Notifier
@@ -55,12 +57,19 @@ class Monitor:
         scraper: ScraperLike | None = None,
         storage: StorageLike | None = None,
         notifier: NotifierLike | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._config = config
         self._scraper: ScraperLike = scraper or Scraper(config.scraper)
         self._storage: StorageLike = storage or Storage(config.seen_file)
         self._notifier: NotifierLike = notifier or Notifier(config.smtp)
-        self._consecutive_failures = 0
+        # 告警状态会持久化，跨进程比较时间，所以用墙上时钟而非 monotonic
+        self._clock = clock
+        self._failures = FailureTracker(
+            config.alert_state_file,
+            threshold=config.failure_alert_threshold,
+            interval=config.failure_alert_interval,
+        )
 
     # ------------------------------------------------------------------
     # public API
@@ -165,42 +174,63 @@ class Monitor:
     # ------------------------------------------------------------------
 
     def _track_failures(self, result: FetchResult, *, dry_run: bool) -> None:
-        """连续抓取失败达到阈值时发送告警邮件"""
-        if result.ok:
-            if self._consecutive_failures:
-                logger.info("抓取已恢复正常（此前连续失败 %d 次）", self._consecutive_failures)
-            self._consecutive_failures = 0
-            return
+        """按页面记录连续抓取失败，需要时发送告警邮件（规则见 web_bugger.alerts）"""
+        tracker = self._failures
+        for url, count in tracker.observe(result.failed_urls).items():
+            logger.info("页面已恢复正常: %s（此前连续失败 %d 次）", url, count)
+        if result.failed_urls:
+            logger.warning(
+                "连续失败次数: %s",
+                ", ".join(f"{u} ×{tracker.streak(u)}" for u in result.failed_urls),
+            )
+        if dry_run:
+            return  # dry-run 不发告警、也不写状态文件
 
-        self._consecutive_failures += 1
-        logger.warning(
-            "第 %d 次连续出现抓取失败（%d/%d 个页面）",
-            self._consecutive_failures,
-            len(result.failed_urls),
-            result.pages_total,
-        )
+        now = self._clock()
+        if tracker.alert_due(now):
+            failing = tracker.failing()
+            if self._notifier.send_alert(*self._build_alert(result, failing)):
+                tracker.mark_alerted(failing, now)
+            else:
+                tracker.mark_send_failed(now)
+        tracker.save()
 
-        threshold = max(1, self._config.failure_alert_threshold)
-        should_alert = (
-            self._consecutive_failures >= threshold
-            and (self._consecutive_failures - threshold) % threshold == 0
-        )
-        if not should_alert or dry_run:
-            return
-
-        subject = f"【交大信息监控】连续 {self._consecutive_failures} 次抓取失败"
+    def _build_alert(self, result: FetchResult, failing: list[str]) -> tuple[str, str]:
+        """构造告警邮件的（主题, 正文）"""
+        tracker = self._failures
+        lines = [
+            f"  - {u}（连续失败 {tracker.streak(u)} 次）"
+            + ("【新增】" if tracker.is_new(u) else "")
+            for u in failing
+        ]
+        if result.all_failed:
+            impact = "所有页面均抓取失败，期间不会有任何新公告通知，请检查服务器网络。"
+        else:
+            impact = (
+                "其余页面的新公告仍会正常通知；上述页面恢复后，"
+                "其间发布且仍在列表中的公告会补发通知。"
+            )
+        subject = f"【交大信息监控】{len(failing)} 个页面持续抓取失败"
         body = (
-            f"公告监控已连续 {self._consecutive_failures} 次抓取失败，"
-            "期间不会有任何新公告通知，请检查网络或页面结构。\n\n"
-            f"失败的页面（{len(result.failed_urls)}/{result.pages_total}）：\n"
-            + "\n".join(f"  - {u}" for u in result.failed_urls)
-            + "\n\n本次成功抓取到的公告数："
-            f"{len(result.items)}\n"
+            f"以下页面持续抓取失败（{len(failing)}/{result.pages_total}），"
+            "请检查网络或页面结构：\n"
+            + "\n".join(lines)
+            + f"\n\n{impact}\n本次成功抓取到的公告数：{len(result.items)}\n\n"
+            f"同一页面持续失败时，每 {_humanize_seconds(self._config.failure_alert_interval)} "
+            "最多提醒一次；新出问题的页面会立即提醒；页面恢复后不会另发邮件。\n"
         )
-        self._notifier.send_alert(subject, body)
+        return subject, body
 
     @staticmethod
     def _log_new(items: list[Announcement]) -> None:
         logger.info("发现 %d 条新公告:", len(items))
         for a in items:
             logger.info("  [%s] %s (%s)", a.section, a.title, a.date)
+
+
+def _humanize_seconds(seconds: int) -> str:
+    """86400 -> '1 天'，7200 -> '2 小时'，90 -> '90 秒'"""
+    for unit, name in ((86400, "天"), (3600, "小时"), (60, "分钟")):
+        if seconds >= unit and seconds % unit == 0:
+            return f"{seconds // unit} {name}"
+    return f"{seconds} 秒"

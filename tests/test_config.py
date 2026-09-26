@@ -76,6 +76,7 @@ class TestFromEnv:
                     "RECEIVER_EMAIL=me@163.com",
                     "CHECK_INTERVAL=600",
                     "FAILURE_ALERT_THRESHOLD=5",
+                    "FAILURE_ALERT_INTERVAL=3600",
                     "MAX_RETRIES=1",
                     "MAX_WORKERS=2",
                     "MAX_PAGES=7",
@@ -92,12 +93,14 @@ class TestFromEnv:
         assert cfg.smtp.receiver_email == "me@163.com"
         assert cfg.check_interval == 600
         assert cfg.failure_alert_threshold == 5
+        assert cfg.failure_alert_interval == 3600
         assert cfg.scraper.max_retries == 1
         assert cfg.scraper.max_workers == 2
         assert cfg.scraper.max_pages == 7
         assert cfg.scraper.request_timeout == 30
         assert cfg.data_dir == tmp_path / "data"
         assert cfg.seen_file == tmp_path / "data" / "seen_announcements.json"
+        assert cfg.alert_state_file == tmp_path / "data" / "alert_state.json"
 
     def test_target_urls_are_split_and_stripped(self, tmp_path: Path) -> None:
         env = _write_env(

@@ -1,5 +1,6 @@
 # 运行时生成的文件
 seen_announcements.json
+alert_state.json
 __pycache__/
 *.pyc
 *.pyo

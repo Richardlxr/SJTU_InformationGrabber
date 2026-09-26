@@ -137,12 +137,18 @@ class AppConfig:
     scraper: ScraperConfig = field(default_factory=ScraperConfig)
     check_interval: int = 300
     failure_alert_threshold: int = 3
+    failure_alert_interval: int = 86400
     data_dir: Path = field(default_factory=_default_data_dir)
 
     @property
     def seen_file(self) -> Path:
         """已读公告存储文件路径"""
         return self.data_dir / "seen_announcements.json"
+
+    @property
+    def alert_state_file(self) -> Path:
+        """抓取失败告警状态文件路径"""
+        return self.data_dir / "alert_state.json"
 
     @classmethod
     def from_env(cls, env_file: str | Path | None = None) -> AppConfig:
@@ -194,5 +200,8 @@ class AppConfig:
             scraper=scraper,
             check_interval=_env_int("CHECK_INTERVAL", 300, minimum=10, maximum=86400),
             failure_alert_threshold=_env_int("FAILURE_ALERT_THRESHOLD", 3, minimum=1, maximum=100),
+            failure_alert_interval=_env_int(
+                "FAILURE_ALERT_INTERVAL", 86400, minimum=60, maximum=30 * 86400
+            ),
             data_dir=_default_data_dir(),
         )

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from web_bugger.alerts import ALERT_RETRY_BACKOFF
 from web_bugger.config import AppConfig, ScraperConfig
 from web_bugger.models import Announcement
 from web_bugger.monitor import Monitor
@@ -51,11 +52,22 @@ class FakeNotifier:
         return self.ok
 
 
-def _config(tmp_path: Path, *, failure_alert_threshold: int = 3) -> AppConfig:
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _config(
+    tmp_path: Path, *, failure_alert_threshold: int = 3, failure_alert_interval: int = 86400
+) -> AppConfig:
     return AppConfig(
         scraper=ScraperConfig(target_urls=["https://x.com/page"]),
         data_dir=tmp_path,
         failure_alert_threshold=failure_alert_threshold,
+        failure_alert_interval=failure_alert_interval,
     )
 
 
@@ -66,12 +78,19 @@ def _monitor(
     storage: Storage | None = None,
     *,
     failure_alert_threshold: int = 3,
+    failure_alert_interval: int = 86400,
+    clock: FakeClock | None = None,
 ) -> Monitor:
     return Monitor(
-        _config(tmp_path, failure_alert_threshold=failure_alert_threshold),
+        _config(
+            tmp_path,
+            failure_alert_threshold=failure_alert_threshold,
+            failure_alert_interval=failure_alert_interval,
+        ),
         scraper=scraper,
         storage=storage or Storage(tmp_path / "seen_announcements.json"),
         notifier=notifier or FakeNotifier(),
+        clock=clock or FakeClock(),
     )
 
 
@@ -163,14 +182,142 @@ class TestFailureAlert:
         assert len(notifier.alerts) == 1, "第 3 次失败应发告警"
         assert "抓取失败" in notifier.alerts[0][0]
 
-    def test_alert_repeats_every_threshold(self, tmp_path: Path) -> None:
+    def test_alert_repeats_once_per_configured_interval(self, tmp_path: Path) -> None:
         notifier = FakeNotifier()
+        clock = FakeClock()
         monitor = _monitor(
-            tmp_path, FakeScraper(self._failed()), notifier, failure_alert_threshold=2
+            tmp_path,
+            FakeScraper(self._failed()),
+            notifier,
+            failure_alert_threshold=1,
+            failure_alert_interval=7200,
+            clock=clock,
+        )
+        monitor.check_once()
+        assert len(notifier.alerts) == 1
+
+        clock.now = 7199
+        monitor.check_once()
+        assert len(notifier.alerts) == 1, "间隔未满不应重复告警"
+
+        clock.now = 7200
+        monitor.check_once()
+        assert len(notifier.alerts) == 2, "满一个间隔后应再提醒一次"
+        assert "每 2 小时" in notifier.alerts[1][1]
+
+    def test_new_failing_page_alerts_immediately(self, tmp_path: Path) -> None:
+        """回归：旧页面持续报错期间，新出问题的页面不能被 1 天的间隔压住"""
+        notifier = FakeNotifier()
+        clock = FakeClock()
+        old = FetchResult(items=[A1], pages_total=3, failed_urls=("old",))
+        both = FetchResult(items=[A1], pages_total=3, failed_urls=("old", "new"))
+        monitor = _monitor(
+            tmp_path, FakeScraper(old, old, both), notifier, failure_alert_threshold=2, clock=clock
+        )
+
+        monitor.check_once()
+        monitor.check_once()  # old 达到阈值 -> 告警
+        assert len(notifier.alerts) == 1
+
+        for _ in range(3):  # new 连续失败
+            clock.now += 300
+            monitor.check_once()
+        assert len(notifier.alerts) == 2, "new 达到阈值应立即告警"
+        body = notifier.alerts[1][1]
+        assert "new（连续失败 2 次）【新增】" in body
+        assert "old（连续失败 4 次）\n" in body, "早已提醒过的页面不标【新增】"
+
+    def test_transient_failure_does_not_alert(self, tmp_path: Path) -> None:
+        notifier = FakeNotifier()
+        old = FetchResult(items=[A1], pages_total=3, failed_urls=("old",))
+        blip = FetchResult(items=[A1], pages_total=3, failed_urls=("old", "new"))
+        monitor = _monitor(
+            tmp_path, FakeScraper(old, old, blip, old), notifier, failure_alert_threshold=2
         )
         for _ in range(4):
             monitor.check_once()
-        assert len(notifier.alerts) == 2
+        assert len(notifier.alerts) == 1, "new 只失败一次，不应告警"
+
+    def test_flapping_page_alerts_once_per_interval(self, tmp_path: Path) -> None:
+        """回归：页面时好时坏（失败 3 次、恢复 1 次）也只能每个间隔提醒一次"""
+        notifier = FakeNotifier()
+        clock = FakeClock()
+        fail = FetchResult(items=[A1], pages_total=2, failed_urls=("a",))
+        ok = FetchResult(items=[A1], pages_total=2)
+        rounds = ([fail] * 3 + [ok]) * 72  # 24 小时，每 5 分钟一轮
+        monitor = _monitor(
+            tmp_path, FakeScraper(*rounds), notifier, failure_alert_threshold=3, clock=clock
+        )
+        for _ in rounds:
+            monitor.check_once()
+            clock.now += 300
+        assert len(notifier.alerts) == 1
+
+    def test_failed_alert_send_backs_off(self, tmp_path: Path) -> None:
+        notifier = FakeNotifier(ok=False)
+        clock = FakeClock()
+        monitor = _monitor(
+            tmp_path, FakeScraper(self._failed()), notifier, failure_alert_threshold=1, clock=clock
+        )
+        monitor.check_once()
+        clock.now = ALERT_RETRY_BACKOFF - 1
+        monitor.check_once()
+        assert len(notifier.alerts) == 1, "发送失败后退避期内不应重试"
+
+        clock.now = ALERT_RETRY_BACKOFF
+        notifier.ok = True
+        monitor.check_once()
+        assert len(notifier.alerts) == 2, "退避期满后应重试"
+        clock.now += 300
+        monitor.check_once()
+        assert len(notifier.alerts) == 2, "发送成功后恢复按间隔提醒"
+
+    def test_state_survives_restart(self, tmp_path: Path) -> None:
+        """回归：重启（新 Monitor 实例）后不应重新计数、重复告警"""
+        clock = FakeClock()
+        first = FakeNotifier()
+        monitor = _monitor(
+            tmp_path, FakeScraper(self._failed()), first, failure_alert_threshold=2, clock=clock
+        )
+        monitor.check_once()
+        monitor.check_once()
+        assert len(first.alerts) == 1
+
+        clock.now += 600
+        second = FakeNotifier()
+        restarted = _monitor(
+            tmp_path, FakeScraper(self._failed()), second, failure_alert_threshold=2, clock=clock
+        )
+        restarted.check_once()
+        assert second.alerts == [], "重启后仍在间隔内，不应再告警"
+
+    def test_streak_persists_across_once_runs(self, tmp_path: Path) -> None:
+        """--once 定时运行：每次都是新进程，连续失败次数也要累计"""
+        notifier = FakeNotifier()
+        for _ in range(3):
+            _monitor(
+                tmp_path, FakeScraper(self._failed()), notifier, failure_alert_threshold=3
+            ).check_once()
+        assert len(notifier.alerts) == 1
+
+    def test_alert_text_partial_failure(self, tmp_path: Path) -> None:
+        notifier = FakeNotifier()
+        partial = FetchResult(items=[A1], pages_total=3, failed_urls=("a",))
+        monitor = _monitor(tmp_path, FakeScraper(partial), notifier, failure_alert_threshold=1)
+        monitor.check_once()
+        subject, body = notifier.alerts[0]
+        assert subject == "【交大信息监控】1 个页面持续抓取失败"
+        assert "其余页面的新公告仍会正常通知" in body
+        assert "不会有任何新公告通知" not in body
+        assert "每 1 天" in body
+
+    def test_alert_text_all_failed(self, tmp_path: Path) -> None:
+        notifier = FakeNotifier()
+        monitor = _monitor(
+            tmp_path, FakeScraper(self._failed()), notifier, failure_alert_threshold=1
+        )
+        monitor.check_once()
+        assert "所有页面均抓取失败" in notifier.alerts[0][1]
 
     def test_success_resets_counter(self, tmp_path: Path) -> None:
         notifier = FakeNotifier()
@@ -196,6 +343,7 @@ class TestFailureAlert:
         )
         monitor.check_once(dry_run=True)
         assert notifier.alerts == []
+        assert not (tmp_path / "alert_state.json").exists(), "dry-run 不应写告警状态"
 
 
 class TestRunLoop:

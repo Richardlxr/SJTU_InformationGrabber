@@ -103,21 +103,32 @@ class Storage:
 
     def _save(self) -> None:
         payload = json.dumps(sorted(self._seen), ensure_ascii=False, indent=2)
-        tmp_path: str | None = None
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(self._path.parent), prefix=f".{self._path.name}.", suffix=".tmp"
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_path, self._path)
-            tmp_path = None
+            atomic_write_text(self._path, payload)
         except OSError as e:
             logger.error("保存已存储公告文件失败: %s", e)
-        finally:
-            if tmp_path is not None:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """
+    以「临时文件 + fsync + os.replace」原子写入文本文件。
+
+    Raises:
+        OSError: 写入失败（临时文件会被清理，原文件保持不变）
+    """
+    tmp_path: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
