@@ -24,12 +24,12 @@
 | [计算机学院 · 团学工作](https://cs.sjtu.edu.cn/xsgz-tzgg-txgz.html) | 团学工作 |
 | [计算机学院 · 学生事务](https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html) | 学生事务 |
 | [计算机学院 · 职业发展](https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html) | 职业发展 |
-| [致远学院 · 讲座活动](https://zhiyuan.sjtu.edu.cn/html/zhiyuan/events_list.php) | ZY-INS 沙龙、学术报告、未来学者项目等 |
-| [致远学院 · 通知公告](https://zhiyuan.sjtu.edu.cn/html/zhiyuan/announcement_list.php) | 学院通知公告（通识课程、招生报名、综合测评等） |
+| [致远学院 · 学术活动](https://zhiyuan.sjtu.edu.cn/event) | ZY-INS 沙龙、ChalkTalk、全球系列讲座等（邮件中带活动时间） |
+| [致远学院 · 通知动态](https://zhiyuan.sjtu.edu.cn/announcement) | 学院全部通知（综合 / 招生 / 教学 / 学生事务、合作交流、团学工作等） |
 
-> 致远学院两个页面是 JS/AJAX 渲染的，直接解析其 JSON 接口（`/api/get_*`）。
-> 这两个接口历史很深（通知 1000+ 条、活动 600+ 条），而新条目总排在最前，
-> 因此只抓取最近 2 页（每页 50 条），保留 `MAX_PAGES` 作为安全上限。
+> 致远学院官网 2026 年 9 月改版后，两个列表都是服务端渲染的 HTML（`?page=N` 翻页，每页 12 条）。
+> 列表历史很深（通知 1100+ 条、活动 400+ 条），新条目排在最前，但活动列表偶尔会把补录的旧活动
+> 插到前面，因此只抓取最近 3 页，保留 `MAX_PAGES` 作为安全上限。
 
 ## 项目结构
 
@@ -90,7 +90,7 @@ cp .env.example .env
 | `REQUEST_TIMEOUT` | | 单次 HTTP 超时秒数（默认 `15`） |
 | `MAX_RETRIES` | | 单页面失败重试次数（默认 `3`） |
 | `MAX_WORKERS` | | 并发抓取页面数（默认 `4`） |
-| `MAX_PAGES` | | 单个 AJAX 板块最大翻页数（默认 `50`，防止死循环） |
+| `MAX_PAGES` | | 单个板块最大翻页数（默认 `50`，防止死循环；致远学院固定只取最近 3 页） |
 | `FAILURE_ALERT_THRESHOLD` | | 某个页面连续抓取失败多少次后发告警邮件（默认 `3`） |
 | `FAILURE_ALERT_INTERVAL` | | 同一页面持续失败时重复提醒的最小间隔秒数（默认 `86400` = 1 天；新出问题的页面会立即提醒） |
 

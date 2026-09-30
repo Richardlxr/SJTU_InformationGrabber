@@ -1,22 +1,25 @@
 """
-爬虫模块 - 从上海交通大学教务处/计算机学院网站抓取公告（支持多个页面、多种布局）
+爬虫模块 - 从上海交通大学教务处/计算机学院/致远学院网站抓取公告（支持多个页面、多种布局）
 
 支持布局:
   A — jwc.sjtu.edu.cn 教务处板块式
   B — jwc.sjtu.edu.cn 面向学生通知列表式
   C — cs.sjtu.edu.cn  计算机学院学生工作 AJAX 分页列表式
+  D — zhiyuan.sjtu.edu.cn 致远学院通知动态 / 学术活动（服务端渲染，?page=N 翻页）
+
+无法识别的页面结构按抓取失败处理，以便触发告警，而不是静默返回空列表。
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -34,16 +37,16 @@ _UNTRUSTED_ENCODINGS = {"", "iso-8859-1", "latin-1", "ascii", "us-ascii"}
 
 _INVALID_HREF_PREFIXES = ("#", "javascript:", "mailto:", "tel:")
 
-# 布局 D: zhiyuan.sjtu.edu.cn 致远学院 AJAX 接口
-_ZHIYUAN_API_BASE = "https://zhiyuan.sjtu.edu.cn/api/"
-_ZHIYUAN_VIEW_BASE = "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/"
-_ZHIYUAN_PAGE_SIZE = 50
-# 这两个接口历史很深（通知 1141 条 / 活动 637 条），而新条目永远排在最前，
-# 所以只取最近几页即可：既覆盖新公告，又不必每轮拉全量历史。
-_ZHIYUAN_RECENT_PAGES = 2
-# 活动分类 523 的详情不在本院站点，而在 ins.sjtu.edu.cn（与官网 JS 一致）
-_ZHIYUAN_INS_CATEGORY = 523
-_ZHIYUAN_INS_BASE = "https://ins.sjtu.edu.cn/seminars/"
+# 布局 D: zhiyuan.sjtu.edu.cn 致远学院（2026-09 改版后为服务端渲染列表，每页 12 条）
+# 两个列表历史都很深（通知 1100+ 条 / 活动 400+ 条），新条目排在最前；但活动列表偶尔
+# 会把补录的旧活动插到前面，所以多取几页，既覆盖新条目，又不必每轮拉全量历史。
+_ZHIYUAN_RECENT_PAGES = 3
+_ZHIYUAN_ANNOUNCEMENT_SECTION = "致远通知公告"
+_ZHIYUAN_EVENT_SECTION = "致远讲座活动"
+# laypage.render({ ... }) 的选项部分（截到第一个花括号为止，jump 回调的函数体不在内）
+_LAYPAGE_OPTIONS_RE = re.compile(r"laypage\.render\(\s*\{([^{}]*)")
+# 活动卡片里的时间，如 "2026-09-30 12:00"
+_ZHIYUAN_EVENT_TIME_RE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2})?")
 
 
 @dataclass(frozen=True)
@@ -182,7 +185,7 @@ class Scraper:
         return FetchResult(items=all_items, pages_total=len(urls), failed_urls=tuple(failed))
 
     def _fetch_one(self, url: str) -> list[Announcement] | None:
-        """下载并解析单个页面；失败返回 None"""
+        """下载并解析单个页面；下载失败或页面结构无法识别时返回 None"""
         html = self._download(url)
         if html is None:
             return None
@@ -229,19 +232,24 @@ class Scraper:
     # parse — 自动检测页面布局并分派
     # ------------------------------------------------------------------
 
-    def _parse(self, html: str, page_url: str) -> list[Announcement]:
-        """根据页面结构自动选择解析策略"""
+    def _parse(self, html: str, page_url: str) -> list[Announcement] | None:
+        """
+        根据页面结构自动选择解析策略。
+
+        Returns:
+            公告列表；页面结构无法识别时返回 None（按抓取失败处理，以便触发告警）
+        """
         soup = BeautifulSoup(html, "html.parser")
 
         # 布局 C: cs.sjtu.edu.cn 计算机学院 AJAX 动态加载列表
         if soup.select_one("div#article_list") is not None:
             return self._parse_cs_sjtu(html, soup, page_url)
 
-        # 布局 D: zhiyuan.sjtu.edu.cn 致远学院 AJAX 动态加载列表
-        if soup.select_one("div.events-list") is not None:
-            return self._parse_zhiyuan_events(page_url)
+        # 布局 D: zhiyuan.sjtu.edu.cn 致远学院服务端渲染列表
         if soup.select_one("div.announcement-list") is not None:
-            return self._parse_zhiyuan_announcements(page_url)
+            return self._parse_zhiyuan(html, soup, page_url, self._parse_zhiyuan_announcements)
+        if soup.select_one("div.event-list") is not None:
+            return self._parse_zhiyuan(html, soup, page_url, self._parse_zhiyuan_events)
 
         # 布局 A: xwtg.htm 板块式（多个 div.w50l / div.w50r，每个含 Newslist1）
         sections = soup.select("div.w50l, div.w50r")
@@ -253,8 +261,8 @@ class Scraper:
         if newslist:
             return self._parse_mxxsdtz(soup, newslist, page_url)
 
-        logger.warning("未识别的页面布局: %s", page_url)
-        return []
+        logger.error("未识别的页面布局（页面可能已改版）: %s", page_url)
+        return None
 
     # ------------------------------------------------------------------
     # 布局 C — cs.sjtu.edu.cn 计算机学院 AJAX 列表式
@@ -390,129 +398,179 @@ class Scraper:
         return Announcement(title=title, url=url, date=date, section=section)
 
     # ------------------------------------------------------------------
-    # 布局 D — zhiyuan.sjtu.edu.cn 致远学院 AJAX 列表式
+    # 布局 D — zhiyuan.sjtu.edu.cn 致远学院服务端渲染列表
     # ------------------------------------------------------------------
 
-    def _parse_zhiyuan_events(self, page_url: str) -> list[Announcement]:
-        """讲座/活动：GET /api/get_event_by_category"""
-        return self._fetch_zhiyuan_pages(
-            endpoint="get_event_by_category",
-            list_key="events",
-            section="致远讲座活动",
-            parse_item=self._zhiyuan_event_item,
-            extra_params={"active": 0},
-            referer=page_url,
-        )
-
-    def _parse_zhiyuan_announcements(self, page_url: str) -> list[Announcement]:
-        """通知公告：GET /api/get_announcements_by_category"""
-        return self._fetch_zhiyuan_pages(
-            endpoint="get_announcements_by_category",
-            list_key="announcements",
-            section="致远通知公告",
-            parse_item=self._zhiyuan_announcement_item,
-            extra_params={},
-            referer=page_url,
-        )
-
-    def _fetch_zhiyuan_pages(
+    def _parse_zhiyuan(
         self,
-        *,
-        endpoint: str,
-        list_key: str,
-        section: str,
-        parse_item: Callable[[dict[str, Any], str], Announcement | None],
-        extra_params: dict[str, Any],
-        referer: str,
-    ) -> list[Announcement]:
-        """分页读取致远学院 JSON 接口（只取最近若干页，见 _ZHIYUAN_RECENT_PAGES）"""
-        results: list[Announcement] = []
-        seen_urls: set[str] = set()
-        max_pages = max(1, min(self._config.max_pages, _ZHIYUAN_RECENT_PAGES))
+        html: str,
+        soup: BeautifulSoup,
+        page_url: str,
+        parse_page: Callable[[BeautifulSoup, str], list[Announcement]],
+    ) -> list[Announcement] | None:
+        """
+        目标页面本身就是第 1 页，其后按 ?page=N 翻页（只取最近 _ZHIYUAN_RECENT_PAGES 页）。
 
-        for page in range(1, max_pages + 1):
-            params: dict[str, Any] = {
-                "num": _ZHIYUAN_PAGE_SIZE,
-                "category": -1,
-                "page": page,
-                **extra_params,
-            }
-            try:
-                resp = self._session.get(
-                    f"{_ZHIYUAN_API_BASE}{endpoint}",
-                    params=params,
-                    timeout=self._config.request_timeout,
-                    headers={"Referer": referer, "X-Requested-With": "XMLHttpRequest"},
+        第 1 页声称有内容（分页组件显示总数 > 0）却一条都解析不出时，说明页面结构变了，
+        返回 None 按抓取失败处理；后续页面失败只影响「补漏」，保留已抓到的结果。
+        """
+        results = parse_page(soup, page_url)
+        pagination = self._laypage(html)
+        if not results:
+            if pagination is not None and pagination[0] > 0:
+                logger.error(
+                    "致远学院列表有 %d 条却解析不出任何条目，页面结构可能已变化: %s",
+                    pagination[0],
+                    page_url,
                 )
-                resp.raise_for_status()
-                data = resp.json()
-            except (requests.RequestException, ValueError) as e:
-                logger.error("zhiyuan AJAX 请求失败 (%s, page=%d): %s", endpoint, page, e)
+                return None
+            return []
+
+        # 条目数不超过一页时页面上没有分页组件
+        total_pages = math.ceil(pagination[0] / pagination[1]) if pagination else 1
+        last_page = min(total_pages, max(1, min(self._config.max_pages, _ZHIYUAN_RECENT_PAGES)))
+        seen_urls = {a.url for a in results}
+
+        for page in range(2, last_page + 1):
+            page_html = self._download(_with_query_param(page_url, "page", str(page)))
+            if page_html is None:
+                logger.warning(
+                    "致远学院第 %d 页抓取失败，本轮只使用前 %d 页: %s", page, page - 1, page_url
+                )
                 break
+            new = [
+                a
+                for a in parse_page(BeautifulSoup(page_html, "html.parser"), page_url)
+                if a.url not in seen_urls
+            ]
+            if not new:
+                break  # 已无更多条目（或服务端忽略了 page 参数）
+            seen_urls.update(a.url for a in new)
+            results.extend(new)
 
-            if not isinstance(data, dict) or data.get("status") != 200:
-                logger.error("zhiyuan AJAX 返回异常 (%s, page=%d): %r", endpoint, page, data)
-                break
-
-            raw_items = data.get(list_key)
-            if not isinstance(raw_items, list):
-                break
-            # 接口偶尔会混入 null 元素（如 announcements 数组）
-            items = [it for it in raw_items if isinstance(it, dict)]
-            if not items:
-                break
-
-            for it in items:
-                ann = parse_item(it, section)
-                if ann is not None and ann.url not in seen_urls:
-                    seen_urls.add(ann.url)
-                    results.append(ann)
-
-            if len(items) < _ZHIYUAN_PAGE_SIZE:
-                break  # 已是最后一页
-
-        logger.debug("zhiyuan [%s] 共抓取 %d 条", section, len(results))
+        logger.debug("zhiyuan 共抓取 %d 条（%s）", len(results), page_url)
         return results
 
-    @staticmethod
-    def _zhiyuan_title(item: dict[str, Any]) -> str:
-        return str(item.get("cn_title") or item.get("en_title") or "").strip()
-
-    @staticmethod
-    def _zhiyuan_date(raw: Any) -> str:
-        """'2026-09-10 15:14:31' -> '2026-09-10'"""
-        text = str(raw or "").strip()
-        return text[:10] if len(text) >= 10 else text
+    @classmethod
+    def _parse_zhiyuan_announcements(cls, soup: BeautifulSoup, page_url: str) -> list[Announcement]:
+        """
+        通知动态（/announcement），HTML 结构:
+          <div class="announcement-list">
+            <a class="item" href="https://zhiyuan.sjtu.edu.cn/post/3121">
+              <div class="ala-calendar">
+                <div class="day">30</div><div class="month">2026-09</div>
+              </div>
+              <div class="item-body"><div class="title">标题</div></div>
+              <div class="item-foot"><div class="ala-tag">学生事务</div></div>
+            </a>
+          </div>
+        """
+        results: list[Announcement] = []
+        for item in soup.select("div.announcement-list a.item"):
+            card = cls._zhiyuan_card(item, page_url)
+            if card is None:
+                continue
+            url, title, tag = card
+            results.append(
+                Announcement(
+                    title=title,
+                    url=url,
+                    date=cls._zhiyuan_calendar_date(item),
+                    section=cls._zhiyuan_section(_ZHIYUAN_ANNOUNCEMENT_SECTION, tag),
+                )
+            )
+        return results
 
     @classmethod
-    def _zhiyuan_announcement_item(cls, item: dict[str, Any], section: str) -> Announcement | None:
-        title = cls._zhiyuan_title(item)
-        item_id = item.get("id")
-        if not title or item_id is None:
-            return None
-        return Announcement(
-            title=title,
-            url=urljoin(_ZHIYUAN_VIEW_BASE, f"announcement_view.php?id={item_id}"),
-            date=cls._zhiyuan_date(item.get("publish_time")),
-            section=section,
-        )
+    def _parse_zhiyuan_events(cls, soup: BeautifulSoup, page_url: str) -> list[Announcement]:
+        """
+        学术活动（/event），HTML 结构:
+          <div class="event-list">
+            <a class="event-card" href="https://zhiyuan.sjtu.edu.cn/event/2639">
+              <div class="ala-calendar">
+                <div class="day">30</div><div class="month">2026-09</div>
+              </div>
+              <div class="ala-tag">ChalkTalk</div>
+              <div class="title">标题</div>
+              <div class="ala-info">
+                <div class="item"><i class="icon-calendar-o"></i> 2026-09-30 12:00</div>
+                <div class="item"><i class="icon-location-o"></i> 地点</div>
+              </div>
+            </a>
+          </div>
+
+        日期取活动举办时间（精确到分钟），缺失时退回日历块上的日期。
+        """
+        results: list[Announcement] = []
+        for card_tag in soup.select("div.event-list a.event-card"):
+            card = cls._zhiyuan_card(card_tag, page_url)
+            if card is None:
+                continue
+            url, title, tag = card
+            results.append(
+                Announcement(
+                    title=title,
+                    url=url,
+                    date=cls._zhiyuan_event_time(card_tag) or cls._zhiyuan_calendar_date(card_tag),
+                    section=cls._zhiyuan_section(_ZHIYUAN_EVENT_SECTION, tag),
+                )
+            )
+        return results
 
     @classmethod
-    def _zhiyuan_event_item(cls, item: dict[str, Any], section: str) -> Announcement | None:
-        title = cls._zhiyuan_title(item)
-        event_id = item.get("announcement_id") or item.get("id")
-        if not title or event_id is None:
+    def _zhiyuan_card(cls, item: Tag, page_url: str) -> tuple[str, str, str] | None:
+        """取出（链接, 标题, 分类标签）；缺链接或标题时返回 None"""
+        url = cls._normalize_href(str(item.get("href", "")), page_url)
+        title_tag = item.select_one(".title")
+        title = title_tag.get_text(strip=True) if title_tag else ""
+        if url is None or not title:
             return None
-        if item.get("announce_category_id") == _ZHIYUAN_INS_CATEGORY:
-            url = f"{_ZHIYUAN_INS_BASE}{event_id}"
-        else:
-            url = urljoin(_ZHIYUAN_VIEW_BASE, f"event_view.php?id={event_id}")
-        return Announcement(
-            title=title,
-            url=url,
-            date=cls._zhiyuan_date(item.get("date")),
-            section=section,
-        )
+        tag = item.select_one(".ala-tag")
+        return url, title, tag.get_text(strip=True) if tag else ""
+
+    @staticmethod
+    def _zhiyuan_section(base: str, tag: str) -> str:
+        return f"{base}·{tag}" if tag else base
+
+    @staticmethod
+    def _zhiyuan_calendar_date(item: Tag) -> str:
+        """<div class="day">30</div><div class="month">2026-09</div> -> '2026-09-30'"""
+        day_tag = item.select_one(".ala-calendar .day")
+        month_tag = item.select_one(".ala-calendar .month")
+        if day_tag is None or month_tag is None:
+            return ""
+        day = day_tag.get_text(strip=True)
+        match = re.fullmatch(r"(\d{4})-(\d{1,2})", month_tag.get_text(strip=True))
+        if match is None or not day.isdigit():
+            return ""
+        return f"{match.group(1)}-{match.group(2).zfill(2)}-{day.zfill(2)}"
+
+    @staticmethod
+    def _zhiyuan_event_time(card: Tag) -> str:
+        """活动信息栏里的举办时间，如 '2026-09-30 12:00'；找不到返回空串"""
+        for info in card.select(".ala-info .item"):
+            match = _ZHIYUAN_EVENT_TIME_RE.search(info.get_text(" ", strip=True))
+            if match:
+                return " ".join(match.group(0).split())
+        return ""
+
+    @staticmethod
+    def _laypage(html: str) -> tuple[int, int] | None:
+        """
+        读取 layui 分页组件参数：laypage.render({ count: 1143, limit: 12, curr: 1, ... })。
+
+        注意：站点公共脚本里每页都有一段样板 laypage.render({ count: 100, ... })（没有 limit），
+        必须跳过它，只认同时带 count 和 limit 的那次调用。
+
+        Returns:
+            (总条数, 每页条数)；没有真正的分页组件（条目不足一页）时返回 None
+        """
+        for options in _LAYPAGE_OPTIONS_RE.findall(html):
+            count = re.search(r"\bcount\s*:\s*(\d+)", options)
+            limit = re.search(r"\blimit\s*:\s*(\d+)", options)
+            if count is not None and limit is not None and int(limit.group(1)) > 0:
+                return int(count.group(1)), int(limit.group(1))
+        return None
 
     # ------------------------------------------------------------------
     # 布局 A — xwtg.htm 板块式
@@ -643,3 +701,11 @@ class Scraper:
     def _resolve_url(self, href: str, base_url: str | None = None) -> str:
         """将相对链接解析为绝对链接（无效链接返回空串）"""
         return self._normalize_href(href, base_url or self._config.base_url) or ""
+
+
+def _with_query_param(url: str, key: str, value: str) -> str:
+    """设置（或替换）URL 中的某个查询参数，保留其余参数"""
+    parts = urlsplit(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != key]
+    query.append((key, value))
+    return urlunsplit(parts._replace(query=urlencode(query)))

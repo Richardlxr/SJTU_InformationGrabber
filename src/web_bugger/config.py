@@ -106,9 +106,9 @@ class ScraperConfig:
             "https://cs.sjtu.edu.cn/xsgz-tzgg-txgz.html",
             "https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html",
             "https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html",
-            # 致远学院（讲座活动 / 通知公告，AJAX 接口）
-            "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/events_list.php",
-            "https://zhiyuan.sjtu.edu.cn/html/zhiyuan/announcement_list.php",
+            # 致远学院（学术活动 / 通知动态，服务端渲染列表）
+            "https://zhiyuan.sjtu.edu.cn/event",
+            "https://zhiyuan.sjtu.edu.cn/announcement",
         ]
     )
     base_url: str = "https://jwc.sjtu.edu.cn/"
