@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -143,6 +144,54 @@ class TestCheckOnce:
             FakeScraper(FetchResult(items=[], pages_total=1, failed_urls=("u",))),
         )
         assert monitor.check_once() == 0
+
+
+class EnrichingScraper(FakeScraper):
+    """带 enrich 的假爬虫：给每条公告补上摘要"""
+
+    def __init__(self, *results: FetchResult, fail: bool = False) -> None:
+        super().__init__(*results)
+        self.fail = fail
+        self.enriched: list[list[Announcement]] = []
+
+    def enrich(self, items: list[Announcement]) -> list[Announcement]:
+        self.enriched.append(list(items))
+        if self.fail:
+            raise RuntimeError("详情页解析炸了")
+        return [replace(a, summary=f"{a.title}的摘要") for a in items]
+
+
+class TestEnrich:
+    def test_details_added_before_sending(self, tmp_path: Path) -> None:
+        notifier = FakeNotifier()
+        scraper = EnrichingScraper(FetchResult(items=[A1], pages_total=1))
+        monitor = _monitor(tmp_path, scraper, notifier)
+
+        assert monitor.check_once() == 1
+        assert notifier.sent[0][0].summary == "公告一的摘要"
+        assert Storage(tmp_path / "seen_announcements.json").seen_urls == {A1.url}
+
+    def test_only_new_items_are_enriched(self, tmp_path: Path) -> None:
+        storage = Storage(tmp_path / "seen_announcements.json")
+        storage.mark_seen([A1])
+        scraper = EnrichingScraper(FetchResult(items=[A1, A2], pages_total=1))
+        _monitor(tmp_path, scraper, storage=storage).check_once()
+        assert scraper.enriched == [[A2]]
+
+    def test_not_enriched_in_dry_run(self, tmp_path: Path) -> None:
+        scraper = EnrichingScraper(FetchResult(items=[A1], pages_total=1))
+        _monitor(tmp_path, scraper).check_once(dry_run=True)
+        assert scraper.enriched == []
+
+    def test_enrich_failure_still_sends(self, tmp_path: Path) -> None:
+        """补全详情出错绝不能影响通知本身"""
+        notifier = FakeNotifier()
+        scraper = EnrichingScraper(FetchResult(items=[A1], pages_total=1), fail=True)
+        monitor = _monitor(tmp_path, scraper, notifier)
+
+        assert monitor.check_once() == 1
+        assert notifier.sent == [[A1]]
+        assert notifier.sent[0][0].summary == ""
 
 
 class TestInit:

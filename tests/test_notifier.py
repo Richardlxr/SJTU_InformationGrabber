@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import smtplib
 import socket
+from datetime import datetime
 from email import message_from_string
 from email.parser import Parser
 from typing import Any
@@ -110,19 +111,71 @@ def _decoded_text(body: str) -> str:
     return payload.decode("utf-8") if isinstance(payload, bytes) else ""
 
 
+NOW = datetime(2026, 9, 29, 20, 30)
+
+
+def _mixed() -> list[Announcement]:
+    return [
+        Announcement(
+            title="致远阳光领袖奖学金评选通知",
+            url="https://zhiyuan.sjtu.edu.cn/post/3121",
+            date="2026-09-30",
+            section="学生事务",
+            source="致远学院",
+            summary="为厚植学生家国情怀……",
+        ),
+        Announcement(
+            title="大学物理（荣誉）选拔测试的通知",
+            url="https://jwc.sjtu.edu.cn/info/1222/1.htm",
+            date="2026-09-24",
+            section="面向学生的通知",
+            source="教务处",
+        ),
+        Announcement(
+            title="ChalkTalk No.107",
+            url="https://zhiyuan.sjtu.edu.cn/event/2639",
+            date="2026-09-30 12:00-13:30",
+            section="学术活动·ChalkTalk",
+            source="致远学院",
+            location="110教室",
+            speaker="金梦，教授",
+        ),
+    ]
+
+
 class TestTemplates:
     def test_render_text(self) -> None:
-        text = Notifier._render_text(_items())
+        text = Notifier._render_text(_items(), NOW)
         assert "公告A" in text
         assert "质控办" in text
         assert "https://a.com/1" in text
         assert "2026-03-01" in text
 
+    def test_render_text_rich_fields_grouped(self) -> None:
+        text = Notifier._render_text(_mixed(), NOW)
+        assert text.index("【致远学院】2 条") < text.index("【教务处】1 条"), "按首次出现顺序分组"
+        assert "摘要：为厚植学生家国情怀……" in text
+        assert "时间：2026-09-30 12:00-13:30" in text
+        assert "地点：110教室" in text
+        assert "主讲：金梦，教授" in text
+        assert "• ChalkTalk No.107（明天）" in text
+        assert "致远学院 2 · 教务处 1" in text
+
     def test_render_html(self) -> None:
-        html = Notifier._render_html(_items())
+        html = Notifier._render_html(_items(), NOW)
+        assert html.startswith("<!DOCTYPE html>")
+        assert html.rstrip().endswith("</html>")
         assert "公告A" in html
         assert "https://a.com/1" in html
-        assert "<html>" in html
+        assert "发现 1 条新公告" in html
+
+    def test_render_html_rich_fields(self) -> None:
+        html = Notifier._render_html(_mixed(), NOW)
+        assert html.index(">致远学院<") < html.index(">教务处<"), "按来源分组"
+        assert "为厚植学生家国情怀……" in html
+        assert "110教室" in html and "金梦，教授" in html
+        assert ">明天</span>" in html, "明天举行的活动要有醒目标记"
+        assert "https://zhiyuan.sjtu.edu.cn/" in html, "页脚链接到来源站点首页"
 
     def test_render_html_escapes_untrusted_content(self) -> None:
         html = Notifier._render_html(
@@ -132,18 +185,45 @@ class TestTemplates:
                     url="https://a.com/1?a=1&b=2",
                     date="2026-01-01",
                     section="<b>S</b>",
+                    source="<i>源</i>",
+                    summary="<script>alert(1)</script>",
+                    location="<u>地点</u>",
+                    speaker="<img src=x>",
                 )
-            ]
+            ],
+            NOW,
         )
         assert "<2026级>" not in html, "标题中的 HTML 必须被转义"
         assert "&lt;2026级&gt;" in html
         assert "&amp;" in html
         assert "a=1&b=2" not in html, "URL 中的 & 必须被转义"
-        assert "<b>S</b>" not in html
+        for raw in ("<b>S</b>", "<i>源</i>", "<script>", "<u>地点</u>", "<img src=x>"):
+            assert raw not in html
 
     def test_render_html_handles_empty_list(self) -> None:
-        html = Notifier._render_html([])
-        assert "<strong>0</strong>" in html
+        html = Notifier._render_html([], NOW)
+        assert "发现 0 条新公告" in html
+
+    def test_source_falls_back_to_host(self) -> None:
+        item = Announcement(title="T", url="https://cs.sjtu.edu.cn/1.html", date="", section="")
+        assert "【计算机学院】1 条" in Notifier._render_text([item], NOW)
+        unknown = Announcement(title="T", url="https://x.edu.cn/1", date="", section="")
+        assert "【x.edu.cn】1 条" in Notifier._render_text([unknown], NOW)
+
+    @pytest.mark.parametrize(
+        ("event_date", "badge"),
+        [("2026-09-29 12:00", "今天"), ("2026-09-30", "明天"), ("2026-10-01", ""), ("待定", "")],
+    )
+    def test_event_badge(self, event_date: str, badge: str) -> None:
+        event = Announcement(
+            title="活动", url="https://z/1", date=event_date, section="", location="教室"
+        )
+        text = Notifier._render_text([event], NOW)
+        assert (f"• 活动（{badge}）" in text) if badge else ("• 活动\n" in text)
+
+    def test_announcement_never_gets_badge(self) -> None:
+        notice = Announcement(title="通知", url="https://z/1", date="2026-09-29", section="")
+        assert "• 通知\n" in Notifier._render_text([notice], NOW)
 
 
 class TestBuildMessage:
@@ -152,6 +232,17 @@ class TestBuildMessage:
         assert msg["From"] == "sender@qq.com"
         assert msg["To"] == "me@qq.com"
         assert "1 条新公告" in str(msg["Subject"])
+
+    def test_subject_contains_first_title(self) -> None:
+        assert Notifier._subject(_items()) == "【交大信息监控】1 条新公告：公告A"
+        subject = Notifier._subject(_mixed())
+        assert subject == "【交大信息监控】3 条新公告：致远阳光领袖奖学金评选通知 等"
+
+    def test_subject_truncates_long_title(self) -> None:
+        item = Announcement(title="长" * 80, url="https://a.com/1", date="", section="")
+        subject = Notifier._subject([item])
+        assert subject.endswith("…")
+        assert len(subject) < 80
 
     def test_subject_is_rfc2047_encoded(self) -> None:
         raw = Notifier(_configured())._build_message(_items()).as_string()

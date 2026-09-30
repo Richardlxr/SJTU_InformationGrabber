@@ -133,6 +133,7 @@ class Monitor:
             logger.info("Dry-run 模式：仅打印，不发送邮件、不写入已读状态")
             return len(new)
 
+        new = self._enrich(new)
         if not self._notifier.send(new):
             logger.error("邮件发送失败，不标记已读，下次重试")
             return len(new)
@@ -221,11 +222,24 @@ class Monitor:
         )
         return subject, body
 
+    def _enrich(self, items: list[Announcement]) -> list[Announcement]:
+        """发送前补全摘要等详情；出任何问题都退回原始条目，绝不影响通知"""
+        enrich = getattr(self._scraper, "enrich", None)
+        if not callable(enrich):
+            return items
+        try:
+            enriched = enrich(items)
+        except Exception:
+            logger.exception("补全公告详情时出错，将发送不含摘要的邮件")
+            return items
+        return list(enriched)
+
     @staticmethod
     def _log_new(items: list[Announcement]) -> None:
         logger.info("发现 %d 条新公告:", len(items))
         for a in items:
-            logger.info("  [%s] %s (%s)", a.section, a.title, a.date)
+            label = "·".join(part for part in (a.source, a.section) if part)
+            logger.info("  [%s] %s (%s)", label, a.title, a.date)
 
 
 def _humanize_seconds(seconds: int) -> str:

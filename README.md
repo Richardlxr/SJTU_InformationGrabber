@@ -10,7 +10,8 @@
 ## 功能
 
 - 🔍 同时监控 7 个页面（教务处 + 计算机学院 4 个板块 + 致远学院 2 个板块），自动去重
-- 📧 发现新公告自动发送 HTML 格式邮件（含标题、链接、板块、日期）
+- 📧 发现新公告自动发送 HTML 邮件：按来源（教务处 / 计算机学院 / 致远学院）分组，每条带分类、日期和正文摘要；讲座活动另附时间段、地点、主讲人，当天 / 次日举行的活动会醒目标出
+- 🚨 某个页面持续抓取失败（网络故障、页面改版）时发告警邮件，同一页面每天最多提醒一次
 - 💾 本地 JSON 持久化存储已读公告，避免重复通知
 - 🔄 支持守护模式持续运行 / 单次检查 / 仅打印
 - 📬 支持任意 SMTP 邮箱（QQ / 163 / Gmail / Outlook 等）
@@ -24,7 +25,7 @@
 | [计算机学院 · 团学工作](https://cs.sjtu.edu.cn/xsgz-tzgg-txgz.html) | 团学工作 |
 | [计算机学院 · 学生事务](https://cs.sjtu.edu.cn/xsgz-tzgg-xssw.html) | 学生事务 |
 | [计算机学院 · 职业发展](https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html) | 职业发展 |
-| [致远学院 · 学术活动](https://zhiyuan.sjtu.edu.cn/event) | ZY-INS 沙龙、ChalkTalk、全球系列讲座等（邮件中带活动时间） |
+| [致远学院 · 学术活动](https://zhiyuan.sjtu.edu.cn/event) | ZY-INS 沙龙、ChalkTalk、全球系列讲座等 |
 | [致远学院 · 通知动态](https://zhiyuan.sjtu.edu.cn/announcement) | 学院全部通知（综合 / 招生 / 教学 / 学生事务、合作交流、团学工作等） |
 
 > 致远学院官网 2026 年 9 月改版后，两个列表都是服务端渲染的 HTML（`?page=N` 翻页，每页 12 条）。

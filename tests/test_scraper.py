@@ -14,7 +14,16 @@ import requests
 
 from web_bugger.config import ScraperConfig
 from web_bugger.models import Announcement
-from web_bugger.scraper import FetchResult, Scraper, _with_query_param
+from web_bugger.scraper import (
+    _DETAIL_FETCH_LIMIT,
+    _SUMMARY_MAX_CHARS,
+    FetchResult,
+    Scraper,
+    _element_text,
+    _summarize,
+    _tidy_event_time,
+    _with_query_param,
+)
 
 # 布局 A —— xwtg.htm 板块式
 SAMPLE_XWTG_HTML = """
@@ -251,8 +260,22 @@ class TestScraperMxxsdtz:
         assert results[0].url == "https://jwc.sjtu.edu.cn/info/1222/12345.htm"
         assert results[0].date == "2026-03-15"
         assert results[0].section == "面向学生的通知"
+        assert results[0].source == "教务处"
+        assert results[0].summary == "摘要内容", "列表自带的摘要应被保留"
         assert results[1].url == "https://example.com/external"
         assert results[1].date == "2026-03-02"
+        assert results[1].summary == ""
+
+    def test_summary_strips_repeated_title(self) -> None:
+        html = (
+            '<div class="Newslist"><ul><li class="clearfix">'
+            '<div class="sj"><h2>24</h2><p>2026.09</p></div>'
+            '<div class="wz"><a href="../info/1.htm"><h2>关于选拔测试的通知</h2></a>'
+            "<p>关于选拔测试的通知各位同学：  选拔测试将于\n10月14日举行。</p></div>"
+            "</li></ul></div>"
+        )
+        results = _parse_ok(_scraper(), html, "https://jwc.sjtu.edu.cn/index/mxxsdtz.htm")
+        assert results[0].summary == "各位同学：选拔测试将于 10月14日举行。"
 
     def test_date_extraction(self) -> None:
         from bs4 import BeautifulSoup
@@ -308,6 +331,7 @@ class TestScraperCsSjtu:
 
         assert len(results) == 2
         assert results[0].section == "职业发展"
+        assert results[0].source == "计算机学院"
         assert results[0].date == "2026-05-09"
         assert results[0].url.endswith("/1627.html")
         assert results[1].date == "2026-04-30"
@@ -368,16 +392,16 @@ class TestScraperCsSjtu:
         results = _parse_ok(scraper, SAMPLE_CS_SHELL, "https://cs.sjtu.edu.cn/x.html")
         assert [r.title for r in results] == ["有效标题"]
 
-    def test_missing_cat_code_returns_empty(self) -> None:
+    def test_missing_cat_code_is_failure(self) -> None:
+        """回归：页面结构变了（找不到 cat_code）应按抓取失败处理，而不是静默返回空列表"""
         scraper = _scraper()
-        results = _parse_ok(
-            scraper,
+        results = scraper._parse(
             '<html><body><div id="article_list"></div></body></html>',
             "https://cs.sjtu.edu.cn/x.html",
         )
-        assert results == []
+        assert results is None
 
-    def test_ajax_failure_is_swallowed(self) -> None:
+    def test_ajax_failure_on_first_page_is_failure(self) -> None:
         scraper = _scraper()
 
         class Boom:
@@ -385,10 +409,9 @@ class TestScraperCsSjtu:
                 raise requests.ConnectionError("boom")
 
         self._install(scraper, Boom())
-        results = _parse_ok(scraper, SAMPLE_CS_SHELL, "https://cs.sjtu.edu.cn/x.html")
-        assert results == []
+        assert scraper._parse(SAMPLE_CS_SHELL, "https://cs.sjtu.edu.cn/x.html") is None
 
-    def test_non_dict_json_is_handled(self) -> None:
+    def test_non_dict_json_is_failure(self) -> None:
         scraper = _scraper()
 
         class ListJsonSession:
@@ -396,8 +419,56 @@ class TestScraperCsSjtu:
                 return FakeJsonResponse(["not", "a", "dict"])
 
         self._install(scraper, ListJsonSession())
+        assert scraper._parse(SAMPLE_CS_SHELL, "https://cs.sjtu.edu.cn/x.html") is None
+
+    def test_http_error_on_first_page_is_failure(self) -> None:
+        scraper = _scraper()
+
+        class ServerError:
+            def post(self, url: str, **kwargs: Any) -> FakeJsonResponse:
+                return FakeJsonResponse({}, status_code=500)
+
+        self._install(scraper, ServerError())
+        assert scraper._parse(SAMPLE_CS_SHELL, "https://cs.sjtu.edu.cn/x.html") is None
+
+    def test_later_page_failure_keeps_partial_results(self) -> None:
+        scraper = _scraper()
+        first = [_cs_item(f"https://cs.sjtu.edu.cn/a/{i}.html", f"标题{i}") for i in range(10)]
+
+        class FailsOnPage2(FakeSession):
+            def post(self, url: str, **kwargs: Any) -> FakeJsonResponse:
+                if kwargs["data"]["page"] == 2:
+                    raise requests.ConnectionError("boom")
+                return super().post(url, **kwargs)
+
+        self._install(scraper, FailsOnPage2({1: first}, count=25))
         results = _parse_ok(scraper, SAMPLE_CS_SHELL, "https://cs.sjtu.edu.cn/x.html")
-        assert results == []
+        assert len(results) == 10, "后续页失败不应让整个页面算失败"
+
+    def test_unparseable_items_with_count_is_failure(self) -> None:
+        """接口声称有内容却一条都解析不出 -> 结构变了"""
+        scraper = _scraper()
+        broken = ['<li><span class="renamed">没有链接</span></li>'] * 3
+        self._install(scraper, FakeSession({1: broken}, count=90))
+        assert scraper._parse(SAMPLE_CS_SHELL, "https://cs.sjtu.edu.cn/x.html") is None
+
+    def test_empty_section_is_not_failure(self) -> None:
+        """count 为 0 的空板块是正常情况"""
+        scraper = _scraper()
+        self._install(scraper, FakeSession({}, count=0))
+        assert _parse_ok(scraper, SAMPLE_CS_SHELL, "https://cs.sjtu.edu.cn/x.html") == []
+
+    def test_failure_reported_by_fetch_with_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        scraper = _scraper(target_urls=["https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html"])
+        monkeypatch.setattr(scraper, "_download", lambda url: SAMPLE_CS_SHELL)
+
+        class Boom:
+            def post(self, url: str, **kwargs: Any) -> Any:
+                raise requests.ConnectionError("boom")
+
+        self._install(scraper, Boom())
+        result = scraper.fetch_with_status()
+        assert result.failed_urls == ("https://cs.sjtu.edu.cn/xsgz-tzgg-zyfz.html",)
 
     def test_unknown_cat_code_falls_back_to_active_tab(self) -> None:
         scraper = _scraper()
@@ -559,9 +630,10 @@ class TestScraperZhiyuan:
         ]
         assert results[0].title == "“致远阳光领袖奖学金”评选通知"
         assert results[0].date == "2026-09-30"
-        assert results[0].section == "致远通知公告·学生事务"
+        assert results[0].section == "学生事务"
+        assert results[0].source == "致远学院"
         assert results[1].date == "2026-07-01", "月、日补零"
-        assert results[1].section == "致远通知公告·综合事务"
+        assert results[1].section == "综合事务"
 
     def test_events_parsed_with_time_and_series(self) -> None:
         html = _zhiyuan_page(
@@ -573,7 +645,10 @@ class TestScraperZhiyuan:
         assert results is not None and len(results) == 1
         assert results[0].url == "https://zhiyuan.sjtu.edu.cn/event/2629"
         assert results[0].date == "2026-09-30 12:00", "活动日期用举办时间（精确到分钟）"
-        assert results[0].section == "致远讲座活动·ZY-INS沙龙"
+        assert results[0].section == "学术活动·ZY-INS沙龙"
+        assert results[0].source == "致远学院"
+        assert results[0].location == "110教室"
+        assert results[0].is_event
 
     def test_event_time_falls_back_to_calendar(self) -> None:
         html = _zhiyuan_page("event-list", [_zhiyuan_event(1, "活动", time="时间待定")])
@@ -590,7 +665,7 @@ class TestScraperZhiyuan:
             _zhiyuan_page("announcement-list", [item]), ZHIYUAN_ANNOUNCEMENTS_URL
         )
         assert results is not None
-        assert results[0].section == "致远通知公告"
+        assert results[0].section == "通知动态"
         assert results[0].date == ""
 
     def test_items_without_title_or_href_skipped(self) -> None:
@@ -774,6 +849,208 @@ class TestScraperZhiyuan:
         assert not any("/html/zhiyuan/" in u for u in urls), "旧版致远网址已失效"
         assert "https://jwc.sjtu.edu.cn/xwtg.htm" not in urls, "新闻通告应已移除"
         assert "https://jwc.sjtu.edu.cn/index/mxxsdtz.htm" in urls
+
+
+class FakeHtmlResponse:
+    def __init__(self, text: str, status_code: int = 200) -> None:
+        self.text = text
+        self.content = text.encode("utf-8")
+        self.encoding = "utf-8"
+        self.apparent_encoding = "utf-8"
+        self.status_code = status_code
+        self.url = "https://example.com/"
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"status {self.status_code}")
+
+
+class FakeDetailSession:
+    """按 URL 返回详情页 HTML；未预设的 URL 视为请求失败"""
+
+    def __init__(self, pages: dict[str, str]) -> None:
+        self.pages = pages
+        self.requested: list[str] = []
+
+    def get(self, url: str, **kwargs: Any) -> FakeHtmlResponse:
+        self.requested.append(url)
+        if url not in self.pages:
+            raise requests.ConnectionError("boom")
+        return FakeHtmlResponse(self.pages[url])
+
+    def close(self) -> None:
+        pass
+
+
+def _zhiyuan_detail(body: str, other: tuple[str, ...] = ()) -> str:
+    spans = "".join(f"<span>{x}</span>" for x in other)
+    return (
+        '<html><body><div class="article-container"><div class="article-title"><h3>标题</h3>'
+        f'<div class="article-other"><div class="article-otherBase">{spans}</div></div></div>'
+        f'<div class="ala-section mce-content-body">{body}</div></div></body></html>'
+    )
+
+
+def _event(url: str = "https://zhiyuan.sjtu.edu.cn/event/1", **kwargs: str) -> Announcement:
+    fields = {
+        "title": "ZY-INS沙龙 No.317",
+        "url": url,
+        "date": "2026-09-30 12:00",
+        "section": "学术活动·ZY-INS沙龙",
+        "source": "致远学院",
+        "location": "一楼报告厅",
+    }
+    fields.update(kwargs)
+    return Announcement(**fields)
+
+
+class TestEnrich:
+    """发送前从详情页补全摘要 / 主讲人 / 时间段"""
+
+    def _scraper_with(self, pages: dict[str, str]) -> tuple[Scraper, FakeDetailSession]:
+        scraper = _scraper()
+        session = FakeDetailSession(pages)
+        setattr(scraper, "_session", session)  # noqa: B010 - 测试替身注入
+        return scraper, session
+
+    def test_zhiyuan_post_summary(self) -> None:
+        url = "https://zhiyuan.sjtu.edu.cn/post/3121"
+        scraper, _ = self._scraper_with(
+            {url: _zhiyuan_detail("<p>为厚植学生家国情怀，</p><p>现就评选工作通知如下：</p>")}
+        )
+        item = Announcement(title="评选通知", url=url, date="2026-09-30", section="学生事务")
+        [result] = scraper.enrich([item])
+        assert result.summary == "为厚植学生家国情怀，现就评选工作通知如下："
+        assert result.speaker == ""
+
+    def test_event_with_labelled_fields(self) -> None:
+        """ZY-INS 沙龙格式：主讲嘉宾 / 讲座时间 / 讲座地点 / 报告摘要"""
+        body = (
+            "<p>主讲嘉宾： 许志钦，上海交通大学教授</p><p>讲座时间： 2026.09.30 12:00-13:30</p>"
+            "<p>讲座地点： 致远学院206教室</p><p>报告摘要： 深度学习的基础研究是重要方向。</p>"
+        )
+        scraper, _ = self._scraper_with(
+            {_event().url: _zhiyuan_detail(body, ("2026-09-30  12:00-13:30", "206教室"))}
+        )
+        [result] = scraper.enrich([_event()])
+        assert result.speaker == "许志钦，上海交通大学教授"
+        assert result.summary == "深度学习的基础研究是重要方向。"
+        assert result.date == "2026-09-30 12:00-13:30", "详情页有完整时间段"
+        assert result.location == "一楼报告厅", "地点沿用列表卡片"
+
+    def test_event_chalktalk_format(self) -> None:
+        body = "<p>主讲嘉宾</p><p>金梦，上海交通大学教授</p><p>主讲内容</p><p>海洋覆盖了地球。</p>"
+        scraper, _ = self._scraper_with({_event().url: _zhiyuan_detail(body)})
+        [result] = scraper.enrich([_event()])
+        assert result.speaker == "金梦，上海交通大学教授"
+        assert result.summary == "海洋覆盖了地球。"
+
+    def test_event_without_speaker_field(self) -> None:
+        """「主讲嘉宾」后面紧跟长段正文（没有下一个字段标签）时不当作主讲人"""
+        prose = "2026年9月23日，致远学院特邀牛津大学天体物理学教授做客系列讲座，" * 3
+        scraper, _ = self._scraper_with(
+            {_event().url: _zhiyuan_detail(f"<p>主讲嘉宾</p><p>{prose}</p>")}
+        )
+        [result] = scraper.enrich([_event()])
+        assert result.speaker == ""
+        assert result.summary.startswith("2026年9月23日，致远学院特邀")
+
+    def test_event_detail_time_for_other_day_is_ignored(self) -> None:
+        scraper, _ = self._scraper_with(
+            {_event().url: _zhiyuan_detail("<p>内容</p>", ("2026-10-01  12:00-13:30",))}
+        )
+        [result] = scraper.enrich([_event()])
+        assert result.date == "2026-09-30 12:00"
+
+    def test_cs_detail_summary(self) -> None:
+        url = "https://cs.sjtu.edu.cn/xsgz-tzgg-xssw/1926.html"
+        html = (
+            '<html><body><div class="txt"><p>根据学校通知，</p><p>现将评审工作通知如下。</p></div>'
+        )
+        scraper, _ = self._scraper_with({url: html + "</body></html>"})
+        item = Announcement(title="奖学金评审通知", url=url, date="2026-09-30", section="学生事务")
+        [result] = scraper.enrich([item])
+        assert result.summary == "根据学校通知，现将评审工作通知如下。"
+
+    def test_meta_description_fallback(self) -> None:
+        url = "https://other.edu.cn/1.html"
+        html = (
+            "<html><head><title>某通知</title>"
+            '<meta name="Description" content="这是一段足够长的页面描述，可以作为邮件里的摘要。">'
+            "</head><body></body></html>"
+        )
+        scraper, _ = self._scraper_with({url: html})
+        [result] = scraper.enrich([Announcement(title="某通知", url=url, date="", section="")])
+        assert result.summary == "这是一段足够长的页面描述，可以作为邮件里的摘要。"
+
+    def test_generic_site_description_is_ignored(self) -> None:
+        """计算机学院详情页的 description 只是站点名（也出现在标题里），不能当摘要"""
+        url = "https://cs.sjtu.edu.cn/x/1.html"
+        site = "上海交通大学计算机学院（网络空间安全学院、密码学院）"
+        html = (
+            f"<html><head><title>某通知-{site}</title>"
+            f'<meta name="description" content="{site}"></head><body></body></html>'
+        )
+        scraper, _ = self._scraper_with({url: html})
+        item = Announcement(title="某通知", url=url, date="", section="")
+        assert scraper.enrich([item])[0].summary == ""
+
+    def test_items_with_summary_are_not_fetched(self) -> None:
+        scraper, session = self._scraper_with({})
+        item = Announcement(
+            title="T", url="https://jwc.sjtu.edu.cn/1.htm", date="", section="", summary="已有"
+        )
+        assert scraper.enrich([item]) == [item]
+        assert session.requested == []
+
+    def test_failure_keeps_item_unchanged(self) -> None:
+        scraper, _ = self._scraper_with({})
+        item = Announcement(title="T", url="https://cs.sjtu.edu.cn/1.html", date="d", section="s")
+        [result] = scraper.enrich([item])
+        assert result is item
+
+    def test_fetch_count_is_capped(self) -> None:
+        items = [
+            Announcement(title=f"T{i}", url=f"https://cs.sjtu.edu.cn/{i}.html", date="", section="")
+            for i in range(_DETAIL_FETCH_LIMIT + 5)
+        ]
+        scraper, session = self._scraper_with({})
+        result = scraper.enrich(items)
+        assert len(session.requested) == _DETAIL_FETCH_LIMIT
+        assert [a.url for a in result] == [a.url for a in items], "顺序与数量不变"
+
+    def test_summary_is_truncated(self) -> None:
+        text = "字" * (_SUMMARY_MAX_CHARS + 30)
+        summary = _summarize(text)
+        assert len(summary) == _SUMMARY_MAX_CHARS + 1
+        assert summary.endswith("…")
+
+    def test_summary_strips_title_ignoring_spaces(self) -> None:
+        assert _summarize("关于 2026 年选课的通知：各位同学", "关于2026年选课的通知") == "各位同学"
+        assert _summarize("正文不以标题开头", "标题") == "正文不以标题开头"
+
+    def test_element_text_removes_gaps_between_chinese(self) -> None:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(
+            "<div><p>主讲嘉宾：</p> <p>陈昱</p><p>Deep Learning</p></div>", "html.parser"
+        )
+        assert soup.div is not None
+        assert _element_text(soup.div) == "主讲嘉宾：陈昱 Deep Learning"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("2026-09-30  12:00-13:30", "2026-09-30 12:00-13:30"),
+            ("2026-09-30 12:00", "2026-09-30 12:00"),
+            ("2026-03-16  12:00-12:00", "2026-03-16 12:00"),
+            ("2026-09-18  00:00-00:00", "2026-09-18"),
+            ("2026-09-18 00:00", "2026-09-18"),
+            ("时间待定", ""),
+        ],
+    )
+    def test_tidy_event_time(self, raw: str, expected: str) -> None:
+        assert _tidy_event_time(raw) == expected
 
 
 class TestHelpers:

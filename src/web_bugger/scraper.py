@@ -17,8 +17,9 @@ import math
 import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import TracebackType
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -41,12 +42,38 @@ _INVALID_HREF_PREFIXES = ("#", "javascript:", "mailto:", "tel:")
 # 两个列表历史都很深（通知 1100+ 条 / 活动 400+ 条），新条目排在最前；但活动列表偶尔
 # 会把补录的旧活动插到前面，所以多取几页，既覆盖新条目，又不必每轮拉全量历史。
 _ZHIYUAN_RECENT_PAGES = 3
-_ZHIYUAN_ANNOUNCEMENT_SECTION = "致远通知公告"
-_ZHIYUAN_EVENT_SECTION = "致远讲座活动"
+_ZHIYUAN_ANNOUNCEMENT_SECTION = "通知动态"
+_ZHIYUAN_EVENT_SECTION = "学术活动"
 # laypage.render({ ... }) 的选项部分（截到第一个花括号为止，jump 回调的函数体不在内）
 _LAYPAGE_OPTIONS_RE = re.compile(r"laypage\.render\(\s*\{([^{}]*)")
-# 活动卡片里的时间，如 "2026-09-30 12:00"
-_ZHIYUAN_EVENT_TIME_RE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2})?")
+# 活动时间，如 "2026-09-30 12:00"（列表卡片）或 "2026-09-30  12:00-13:30"（详情页）
+_ZHIYUAN_EVENT_TIME_RE = re.compile(
+    r"(\d{4}-\d{1,2}-\d{1,2})(?:\s+(\d{1,2}:\d{2})(?:\s*-\s*(\d{1,2}:\d{2}))?)?"
+)
+
+# 各布局对应的来源站点（邮件按来源分组）
+_SOURCE_JWC = "教务处"
+_SOURCE_CS = "计算机学院"
+_SOURCE_ZHIYUAN = "致远学院"
+
+# 发送前补全详情：最多抓取的详情页数（首次加入新板块时可能一次几十条）与单页超时
+_DETAIL_FETCH_LIMIT = 20
+_DETAIL_TIMEOUT = 10
+_SUMMARY_MAX_CHARS = 120
+# 详情页正文容器：致远学院 / 计算机学院 / 教务处
+_DETAIL_BODY_SELECTOR = ".article-container .mce-content-body, div.txt, div.v_news_content"
+# 活动详情正文开头的「主讲嘉宾：xxx」（其后紧跟下一个字段标签，或正文结束）
+_EVENT_SPEAKER_RE = re.compile(
+    r"\s*(?:主讲嘉宾|主讲人|报告人)\s*[:：]?\s*(.{2,60}?)\s*"
+    r"(?=讲座时间|报告时间|活动时间|讲座地点|报告地点|活动地点|主讲内容|报告摘要|内容简介|嘉宾介绍|$)"
+)
+# 活动摘要从这些标签之后开始
+_EVENT_ABSTRACT_RE = re.compile(r"(?:报告摘要|主讲内容|内容简介|活动简介|讲座简介)\s*[:：]?\s*")
+_LEADING_SPEAKER_LABEL_RE = re.compile(r"^(?:主讲嘉宾|主讲人|报告人)\s*[:：]?\s*")
+# 两个中文字符（含全角标点）之间的空白：网页排版产生的，不是内容本身
+_CJK_GAP_RE = re.compile(
+    r"(?<=[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])\s+(?=[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])"
+)
 
 
 @dataclass(frozen=True)
@@ -184,6 +211,77 @@ class Scraper:
         )
         return FetchResult(items=all_items, pages_total=len(urls), failed_urls=tuple(failed))
 
+    def enrich(self, announcements: list[Announcement]) -> list[Announcement]:
+        """
+        发送前为新公告补全详情：正文摘要，以及活动的主讲人和精确时间段。
+
+        只处理还没有摘要的条目（最多 _DETAIL_FETCH_LIMIT 条，并发抓取详情页）；
+        任何失败都只是少了这些信息，对应条目原样返回，不影响通知。
+        """
+        todo = [a for a in announcements if not a.summary][:_DETAIL_FETCH_LIMIT]
+        if not todo:
+            return announcements
+        workers = max(1, min(self._config.max_workers, len(todo)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            enriched = dict(
+                zip((a.url for a in todo), pool.map(self._enrich_one, todo), strict=True)
+            )
+        return [enriched.get(a.url, a) for a in announcements]
+
+    def _enrich_one(self, item: Announcement) -> Announcement:
+        try:
+            resp = self._session.get(
+                item.url, timeout=min(self._config.request_timeout, _DETAIL_TIMEOUT)
+            )
+            resp.raise_for_status()
+            return self._parse_detail(item, self._decode(resp))
+        except requests.RequestException as e:
+            logger.warning("获取详情页失败，邮件中将不含摘要 (%s): %s", item.url, e)
+        except Exception:
+            logger.exception("解析详情页出错 (%s)", item.url)
+        return item
+
+    @classmethod
+    def _parse_detail(cls, item: Announcement, html: str) -> Announcement:
+        """从详情页提取摘要；活动另取主讲人和精确时间段"""
+        soup = BeautifulSoup(html, "html.parser")
+        body = soup.select_one(_DETAIL_BODY_SELECTOR)
+        text = _element_text(body) if body is not None else cls._meta_description(soup)
+        changes: dict[str, str] = {}
+
+        if item.is_event:
+            speaker = _EVENT_SPEAKER_RE.match(text)
+            if speaker is not None and not item.speaker:
+                changes["speaker"] = speaker.group(1).rstrip("，,；; ")
+            abstract = _EVENT_ABSTRACT_RE.search(text)
+            if abstract is not None:
+                text = text[abstract.end() :]
+            elif speaker is not None:
+                text = text[speaker.end() :]
+            else:
+                text = _LEADING_SPEAKER_LABEL_RE.sub("", text)
+            # 详情页有完整时间段（列表卡片只有开始时间）
+            time_tag = soup.select_one(".article-otherBase span")
+            if time_tag is not None:
+                detailed = _tidy_event_time(time_tag.get_text(" ", strip=True))
+                if detailed and detailed[:10] == item.date[:10]:
+                    changes["date"] = detailed
+
+        summary = _summarize(text, item.title)
+        if summary:
+            changes["summary"] = summary
+        return replace(item, **changes) if changes else item
+
+    @staticmethod
+    def _meta_description(soup: BeautifulSoup) -> str:
+        """<meta name="description">；与页面标题重复（站点通用描述）或太短时视为无效"""
+        tag = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+        content = " ".join(str(tag.get("content", "")).split()) if isinstance(tag, Tag) else ""
+        page_title = soup.title.get_text(strip=True) if soup.title else ""
+        if len(content) < 20 or content in page_title:
+            return ""
+        return content
+
     def _fetch_one(self, url: str) -> list[Announcement] | None:
         """下载并解析单个页面；下载失败或页面结构无法识别时返回 None"""
         html = self._download(url)
@@ -268,17 +366,22 @@ class Scraper:
     # 布局 C — cs.sjtu.edu.cn 计算机学院 AJAX 列表式
     # ------------------------------------------------------------------
 
-    def _parse_cs_sjtu(self, html: str, soup: BeautifulSoup, page_url: str) -> list[Announcement]:
+    def _parse_cs_sjtu(
+        self, html: str, soup: BeautifulSoup, page_url: str
+    ) -> list[Announcement] | None:
         """
         页面使用 AJAX POST 接口动态加载通知列表：
           POST https://cs.sjtu.edu.cn/active/ajax_type_list.html
           Params: page, cat_code, type, search, extend_id, template
         支持自动翻页直至取得全部公告。
+
+        Returns:
+            公告列表；页面里找不到 cat_code（页面结构变了）或接口失败时返回 None
         """
         m = re.search(r"cat_code\s*:\s*['\"]([^'\"]+)['\"]", html)
         if m is None:
-            logger.warning("cs.sjtu 页面未找到 cat_code，跳过: %s", page_url)
-            return []
+            logger.error("cs.sjtu 页面未找到 cat_code，页面结构可能已变化: %s", page_url)
+            return None
         cat_code = m.group(1)
 
         section_name = self._CS_SJTU_CAT_SECTION.get(cat_code)
@@ -291,9 +394,12 @@ class Scraper:
 
     def _fetch_all_cs_sjtu_pages(
         self, cat_code: str, section: str, referer: str
-    ) -> list[Announcement]:
+    ) -> list[Announcement] | None:
         """
         分页 POST AJAX 接口，取出所有条目。
+
+        第 1 页请求失败、返回结构异常，或接口声称有内容（count > 0）却解析不出任何条目时，
+        返回 None 按抓取失败处理；后续页面失败只记警告，保留已抓到的结果。
 
         必须设置页数上限：若服务端忽略 page 参数（或返回错误的 count），
         `len(results) >= total` 永远不成立，会无限翻页把守护进程卡死。
@@ -304,40 +410,25 @@ class Scraper:
         page = 1
 
         while page <= max_pages:
-            try:
-                resp = self._session.post(
-                    self._CS_SJTU_AJAX_URL,
-                    data={
-                        "page": page,
-                        "cat_code": cat_code,
-                        "type": "",
-                        "search": "",
-                        "extend_id": "0",
-                        "template": "ajax_news_list1_search",
-                    },
-                    timeout=self._config.request_timeout,
-                    headers={
-                        "Referer": referer,
-                        "X-Requested-With": "XMLHttpRequest",
-                    },
+            data = self._post_cs_sjtu_page(cat_code, page, referer)
+            if data is None:
+                if page == 1:
+                    return None
+                logger.warning(
+                    "cs.sjtu [%s] 第 %d 页抓取失败，本轮只使用前 %d 页", section, page, page - 1
                 )
-                resp.raise_for_status()
-                data = resp.json()
-            except (requests.RequestException, ValueError) as e:
-                logger.error("cs.sjtu AJAX 请求失败 (cat=%s, page=%d): %s", cat_code, page, e)
                 break
 
-            if not isinstance(data, dict):
-                logger.error("cs.sjtu AJAX 返回结构异常 (cat=%s): %r", cat_code, data)
-                break
-
+            try:
+                total = int(data.get("count", 0))
+            except (TypeError, ValueError):
+                total = 0
             content_html = data.get("content", "")
-            if not isinstance(content_html, str) or not content_html:
-                break
-
-            items = BeautifulSoup(content_html, "html.parser").find_all("li")
-            if not items:
-                break
+            items = (
+                BeautifulSoup(content_html, "html.parser").find_all("li")
+                if isinstance(content_html, str) and content_html
+                else []
+            )
 
             for item in items:
                 ann = self._parse_cs_sjtu_item(item, section, referer)
@@ -345,11 +436,14 @@ class Scraper:
                     seen_urls.add(ann.url)
                     results.append(ann)
 
-            try:
-                total = int(data.get("count", 0))
-            except (TypeError, ValueError):
-                total = 0
-            if len(results) >= total:
+            if page == 1 and not results and total > 0:
+                logger.error(
+                    "cs.sjtu [%s] 接口声称有 %d 条却解析不出任何条目，接口或页面结构可能已变化",
+                    section,
+                    total,
+                )
+                return None
+            if not items or len(results) >= total:
                 break
             page += 1
         else:
@@ -361,6 +455,35 @@ class Scraper:
 
         logger.debug("cs.sjtu [%s] 共抓取 %d 条（%d 页）", section, len(results), page)
         return results
+
+    def _post_cs_sjtu_page(self, cat_code: str, page: int, referer: str) -> dict[str, Any] | None:
+        """请求 AJAX 接口的某一页；请求失败或返回结构异常时返回 None"""
+        try:
+            resp = self._session.post(
+                self._CS_SJTU_AJAX_URL,
+                data={
+                    "page": page,
+                    "cat_code": cat_code,
+                    "type": "",
+                    "search": "",
+                    "extend_id": "0",
+                    "template": "ajax_news_list1_search",
+                },
+                timeout=self._config.request_timeout,
+                headers={
+                    "Referer": referer,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as e:
+            logger.error("cs.sjtu AJAX 请求失败 (cat=%s, page=%d): %s", cat_code, page, e)
+            return None
+        if not isinstance(data, dict):
+            logger.error("cs.sjtu AJAX 返回结构异常 (cat=%s, page=%d): %r", cat_code, page, data)
+            return None
+        return data
 
     @classmethod
     def _parse_cs_sjtu_item(cls, item: Tag, section: str, base_url: str) -> Announcement | None:
@@ -395,7 +518,7 @@ class Scraper:
             ym = ym_tag.get_text(strip=True) if ym_tag else ""
             date = f"{ym}-{day}" if ym else ""
 
-        return Announcement(title=title, url=url, date=date, section=section)
+        return Announcement(title=title, url=url, date=date, section=section, source=_SOURCE_CS)
 
     # ------------------------------------------------------------------
     # 布局 D — zhiyuan.sjtu.edu.cn 致远学院服务端渲染列表
@@ -476,7 +599,8 @@ class Scraper:
                     title=title,
                     url=url,
                     date=cls._zhiyuan_calendar_date(item),
-                    section=cls._zhiyuan_section(_ZHIYUAN_ANNOUNCEMENT_SECTION, tag),
+                    section=tag or _ZHIYUAN_ANNOUNCEMENT_SECTION,
+                    source=_SOURCE_ZHIYUAN,
                 )
             )
         return results
@@ -499,7 +623,7 @@ class Scraper:
             </a>
           </div>
 
-        日期取活动举办时间（精确到分钟），缺失时退回日历块上的日期。
+        日期取活动举办时间（精确到分钟），缺失时退回日历块上的日期；同时取活动地点。
         """
         results: list[Announcement] = []
         for card_tag in soup.select("div.event-list a.event-card"):
@@ -507,12 +631,15 @@ class Scraper:
             if card is None:
                 continue
             url, title, tag = card
+            time, location = cls._zhiyuan_event_info(card_tag)
             results.append(
                 Announcement(
                     title=title,
                     url=url,
-                    date=cls._zhiyuan_event_time(card_tag) or cls._zhiyuan_calendar_date(card_tag),
-                    section=cls._zhiyuan_section(_ZHIYUAN_EVENT_SECTION, tag),
+                    date=time or cls._zhiyuan_calendar_date(card_tag),
+                    section=f"{_ZHIYUAN_EVENT_SECTION}·{tag}" if tag else _ZHIYUAN_EVENT_SECTION,
+                    source=_SOURCE_ZHIYUAN,
+                    location=location,
                 )
             )
         return results
@@ -529,10 +656,6 @@ class Scraper:
         return url, title, tag.get_text(strip=True) if tag else ""
 
     @staticmethod
-    def _zhiyuan_section(base: str, tag: str) -> str:
-        return f"{base}·{tag}" if tag else base
-
-    @staticmethod
     def _zhiyuan_calendar_date(item: Tag) -> str:
         """<div class="day">30</div><div class="month">2026-09</div> -> '2026-09-30'"""
         day_tag = item.select_one(".ala-calendar .day")
@@ -546,13 +669,19 @@ class Scraper:
         return f"{match.group(1)}-{match.group(2).zfill(2)}-{day.zfill(2)}"
 
     @staticmethod
-    def _zhiyuan_event_time(card: Tag) -> str:
-        """活动信息栏里的举办时间，如 '2026-09-30 12:00'；找不到返回空串"""
+    def _zhiyuan_event_info(card: Tag) -> tuple[str, str]:
+        """
+        活动信息栏：（举办时间, 地点）。时间如 '2026-09-30 12:00'，地点那一栏带定位图标；
+        找不到的返回空串。
+        """
+        time = location = ""
         for info in card.select(".ala-info .item"):
-            match = _ZHIYUAN_EVENT_TIME_RE.search(info.get_text(" ", strip=True))
-            if match:
-                return " ".join(match.group(0).split())
-        return ""
+            text = info.get_text(" ", strip=True)
+            if info.select_one(".icon-location-o") is not None:
+                location = location or text
+            elif not time and _ZHIYUAN_EVENT_TIME_RE.search(text):
+                time = _tidy_event_time(text)
+        return time, location
 
     @staticmethod
     def _laypage(html: str) -> tuple[int, int] | None:
@@ -611,7 +740,7 @@ class Scraper:
         date_span = item.select_one("span")
         date = date_span.get_text(strip=True) if date_span else ""
 
-        return Announcement(title=title, url=url, date=date, section=section)
+        return Announcement(title=title, url=url, date=date, section=section, source=_SOURCE_JWC)
 
     # ------------------------------------------------------------------
     # 布局 B — mxxsdtz.htm 列表式
@@ -658,8 +787,13 @@ class Scraper:
         if not title:
             return None
 
+        # 列表自带正文开头作为摘要：<div class="wz"><a>...</a><p>摘要</p></div>
+        summary_tag = wz.select_one("p")
+        summary = _summarize(_element_text(summary_tag), title) if summary_tag else ""
         date = cls._extract_mxxsdtz_date(item)
-        return Announcement(title=title, url=url, date=date, section=section)
+        return Announcement(
+            title=title, url=url, date=date, section=section, source=_SOURCE_JWC, summary=summary
+        )
 
     @staticmethod
     def _extract_mxxsdtz_date(item: Tag) -> str:
@@ -709,3 +843,55 @@ def _with_query_param(url: str, key: str, value: str) -> str:
     query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != key]
     query.append((key, value))
     return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def _element_text(element: Tag) -> str:
+    """
+    元素的纯文本：片段之间用空格分隔、压缩空白，再去掉两个中文字符之间多余的空格
+    （「主讲嘉宾： 陈昱」->「主讲嘉宾：陈昱」），英文单词之间的空格保留。
+    """
+    text = " ".join(element.get_text(" ").split())
+    return _CJK_GAP_RE.sub("", text)
+
+
+def _summarize(text: str, title: str = "") -> str:
+    """压缩空白、去掉开头重复的标题，截断到 _SUMMARY_MAX_CHARS 字"""
+    text = _strip_prefix_ignoring_spaces(" ".join(text.split()), title)
+    text = text.lstrip(" ：:，,。；;、-—")
+    if len(text) > _SUMMARY_MAX_CHARS:
+        text = text[:_SUMMARY_MAX_CHARS].rstrip() + "…"
+    return text
+
+
+def _strip_prefix_ignoring_spaces(text: str, prefix: str) -> str:
+    """text 以 prefix 开头（忽略空白差异）时去掉这段前缀"""
+    target = "".join(prefix.split())
+    if not target:
+        return text
+    i = j = 0
+    while i < len(text) and j < len(target):
+        if text[i].isspace():
+            i += 1
+        elif text[i] == target[j]:
+            i += 1
+            j += 1
+        else:
+            return text
+    return text[i:] if j == len(target) else text
+
+
+def _tidy_event_time(raw: str) -> str:
+    """
+    规范活动时间：'2026-09-30  12:00-13:30' -> '2026-09-30 12:00-13:30'。
+
+    站点用 00:00 表示「未填时间」，起止相同表示只有开始时间，这两种情况都简化掉。
+    """
+    match = _ZHIYUAN_EVENT_TIME_RE.search(raw)
+    if match is None:
+        return ""
+    day, start, end = match.groups()
+    if start is None or (start == "00:00" and end in (None, "00:00")):
+        return day
+    if end is None or end == start:
+        return f"{day} {start}"
+    return f"{day} {start}-{end}"
